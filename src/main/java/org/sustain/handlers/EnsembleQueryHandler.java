@@ -29,27 +29,55 @@ import io.grpc.stub.StreamObserver;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.spark.api.java.JavaSparkContext;
+import org.apache.spark.ml.feature.*;
+import org.apache.spark.ml.linalg.DenseMatrix;
+import org.apache.spark.ml.linalg.DenseVector;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.sustain.*;
+import org.sustain.Collection;
 import org.sustain.SparkTask;
 import org.sustain.modeling.GBoostRegressionModel;
 import org.sustain.modeling.RFRegressionModel;
 import org.sustain.util.Constants;
 import org.sustain.SparkManager;
+import org.sustain.util.FancyLogger;
+import scala.Tuple2;
+import scala.collection.Iterator;
+import scala.collection.JavaConverters;
+import scala.collection.Seq;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.Future;
 
 public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelResponse> {
 
+    private static final double targetVariance = 0.95;
+    private static final double samplingPercentage = 0.0003;
     private static final Logger log = LogManager.getLogger(EnsembleQueryHandler.class);
 
     public EnsembleQueryHandler(ModelRequest request, StreamObserver<ModelResponse> responseObserver, SparkManager sparkManager) {
         super(request, responseObserver, sparkManager);
+    }
+
+    public int getNoOfPrincipalComponentsByVariance(PCAModel pca, double targetVariance) {
+        int n;
+        double varianceSum = 0.0;
+        DenseVector explainedVariance = pca.explainedVariance();
+        Iterator<Tuple2<Object, Object>> iterator = explainedVariance.iterator();
+        while (iterator.hasNext()) {
+            Tuple2<Object, Object> next = iterator.next();
+            n = Integer.parseInt(next._1().toString()) + 1;
+            if (n >= pca.getK()) {
+                break;
+            }
+            varianceSum += Double.parseDouble(next._2().toString());
+            if (varianceSum >= targetVariance) {
+                return n;
+            }
+        }
+
+        return pca.getK();
     }
 
     protected class RFRegressionTask implements SparkTask<List<ModelResponse>> {
@@ -81,6 +109,76 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
 
             // FETCHING MONGO COLLECTION ONCE FOR ALL MODELS
             Dataset<Row> mongocollection = MongoSpark.load(sparkContext, readConfig).toDF();
+
+            // THE FEATURES THAT NEED COMPRESSING
+            // WORK WITH ALL FEATURES FOR NOW
+            List<String> allFeaturesList = new ArrayList<String>();
+
+            String colnInfo = "";
+
+            for(Tuple2<String,String> dataType: mongocollection.dtypes()) {
+                colnInfo+= dataType._1+" "+dataType._2+"\n";
+                if (!(dataType._2.toLowerCase().contains("string"))) {
+                    allFeaturesList.add(dataType._1);
+                }
+            }
+
+            // THE FEATURES THAT NEED COMPRESSING
+            // WORK WITH ALL FEATURES FOR NOW
+            String[] allFeatures = allFeaturesList.toArray(new String[0]);
+            FancyLogger.fancy_logging("ALL FEATURES: "+Arrays.asList(allFeatures)+"\n"+colnInfo, log);
+            //*****************PCA START************************************
+
+            // Dropping rows with null values
+            Dataset<Row> selectedFeatures = mongocollection.sample(samplingPercentage);
+            selectedFeatures = selectedFeatures.na().drop();
+
+            FancyLogger.fancy_logging("FINISHED SAMPLING: "+Arrays.asList(allFeatures), log);
+
+            // Assembling
+            VectorAssembler assembler = new VectorAssembler().setInputCols(allFeatures).setOutputCol("features");
+            Dataset<Row> featureDF = assembler.transform(selectedFeatures);
+            featureDF.show(10);
+
+            // Scaling
+            log.info("Normalizing features");
+            StandardScaler scaler = new StandardScaler()
+                    .setInputCol("features")
+                    .setOutputCol("normalized_features");
+            StandardScalerModel scalerModel = scaler.fit(featureDF);
+
+            featureDF = scalerModel.transform(featureDF);
+            featureDF = featureDF.drop("features");
+            featureDF = featureDF.withColumnRenamed("normalized_features", "features");
+
+            log.info("Dataframe after normalizing with StandardScaler");
+            //featureDF.show(10);
+
+            //featureDF = featureDF.sample(samplingPercentage);
+
+            // PCA
+            long pcaTime1 = System.currentTimeMillis();
+            PCAModel pca = new PCA()
+                    .setInputCol("features")
+                    .setOutputCol("pcaFeatures")
+                    .setK(7)
+                    .fit(featureDF);
+
+            Dataset<Row> pcaDF = pca.transform(featureDF).select("features", "pcaFeatures");
+            long pcaTime2 = System.currentTimeMillis();
+
+            //pcaDF.write().json("sustain-pcaDF.json");
+            int requiredNoOfPCs = getNoOfPrincipalComponentsByVariance(pca, 0.95);
+            log.info("requiredNoOfPCs: {}", requiredNoOfPCs);
+
+            pcaDF.show(10);
+            //*****************PCA STOP*************************************
+
+            if(allFeatures.length > 0) {
+                FancyLogger.fancy_logging("PCA COMPLETE", log);
+                return null;
+            }
+
             List<ModelResponse> modelResponses = new ArrayList<>();
 
             for (String gisJoin : this.gisJoins) {
@@ -175,6 +273,83 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
 
             // FETCHING MONGO COLLECTION ONCE FOR ALL MODELS
             Dataset<Row> mongocollection = MongoSpark.load(sparkContext, readConfig).toDF();
+
+            // THE FEATURES THAT NEED COMPRESSING
+            // WORK WITH ALL FEATURES FOR NOW
+            /*List<String> allFeaturesList = new ArrayList<String>();
+
+
+
+            String colnInfo = "";
+
+            for(Tuple2<String,String> dataType: mongocollection.dtypes()) {
+                colnInfo+= dataType._1+" "+dataType._2+"\n";
+                if (!(dataType._2.toLowerCase().contains("string"))) {
+                    allFeaturesList.add(dataType._1);
+                }
+            }
+            String[] allFeatures = allFeaturesList.toArray(new String[0]);*/
+
+            String[] allFeatures = {"max_eastward_wind","max_max_air_temperature","max_min_air_temperature","max_northward_wind",
+                    "max_precipitation","max_specific_humidity","max_surface_downwelling_shortwave_flux_in_air","max_vpd","min_eastward_wind",
+                    "min_max_air_temperature","min_min_air_temperature","min_northward_wind","min_precipitation","min_specific_humidity",
+                    "min_surface_downwelling_shortwave_flux_in_air","min_vpd","timestamp"};
+
+            FancyLogger.fancy_logging("ALL FEATURES: "+Arrays.asList(allFeatures), log);
+            //*****************PCA START************************************
+
+            // Dropping rows with null values
+            Dataset<Row> selectedFeatures = mongocollection.sample(samplingPercentage);
+            selectedFeatures = selectedFeatures.na().drop();
+
+            FancyLogger.fancy_logging("FINISHED SAMPLING: "+Arrays.asList(allFeatures), log);
+            // Assembling
+            VectorAssembler assembler = new VectorAssembler().setInputCols(allFeatures).setOutputCol("features");
+            Dataset<Row> featureDF = assembler.transform(selectedFeatures);
+            //featureDF.show(10);
+
+            // Scaling
+            log.info("Normalizing features");
+            StandardScaler scaler = new StandardScaler()
+                    .setInputCol("features")
+                    .setOutputCol("normalized_features");
+            StandardScalerModel scalerModel = scaler.fit(featureDF);
+
+            featureDF = scalerModel.transform(featureDF);
+            featureDF = featureDF.drop("features");
+            featureDF = featureDF.withColumnRenamed("normalized_features", "features");
+
+            log.info("Dataframe after normalizing with StandardScaler");
+            //featureDF.show(10);
+
+            featureDF = featureDF.sample(samplingPercentage);
+
+            // PCA
+            long pcaTime1 = System.currentTimeMillis();
+
+            FancyLogger.fancy_logging("STARTING PCA",log);
+            PCAModel pca = new PCA()
+                    .setInputCol("features")
+                    .setOutputCol("pcaFeatures")
+                    .setK(7)
+                    .fit(featureDF);
+
+            Dataset<Row> pcaDF = pca.transform(featureDF).select("features", "pcaFeatures");
+            //pcaDF.write().json("sustain-pcaDF.json");
+            FancyLogger.fancy_logging("FINISHED PCA",log);
+            int requiredNoOfPCs = getNoOfPrincipalComponentsByVariance(pca, 0.95);
+            log.info("requiredNoOfPCs: {}", requiredNoOfPCs);
+
+            FancyLogger.fancy_logging("EXTRACTED PCs",log);
+            pcaDF.show(10);
+            //*****************PCA STOP*************************************
+
+            if(allFeatures.length > 0) {
+                FancyLogger.fancy_logging("PCA COMPLETE", log);
+                return null;
+            }
+
+
             List<ModelResponse> modelResponses = new ArrayList<>();
 
             for (String gisJoin : this.gisJoins) {
