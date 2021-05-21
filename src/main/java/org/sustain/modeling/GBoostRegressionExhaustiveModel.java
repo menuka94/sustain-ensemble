@@ -29,38 +29,41 @@ import com.mongodb.spark.config.ReadConfig;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.spark.api.java.JavaSparkContext;
+import org.apache.spark.ml.evaluation.RegressionEvaluator;
 import org.apache.spark.ml.feature.VectorAssembler;
+import org.apache.spark.ml.param.ParamMap;
 import org.apache.spark.ml.regression.GBTRegressionModel;
 import org.apache.spark.ml.regression.GBTRegressor;
+import org.apache.spark.ml.tuning.CrossValidator;
+import org.apache.spark.ml.tuning.CrossValidatorModel;
+import org.apache.spark.ml.tuning.ParamGridBuilder;
 import org.apache.spark.mllib.evaluation.RegressionMetrics;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.storage.StorageLevel;
 import org.sustain.util.Constants;
+import org.sustain.util.FancyLogger;
 import scala.collection.JavaConverters;
 import scala.collection.Seq;
-
-import org.sustain.SparkManager;
-import org.sustain.SparkTask;
 
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.Future;
 
+// PERFORMS EXHAUSTIVE TRAINING OVER A SET OF PARAMETERS
 /**
  * Provides an interface for building generalized Gradient Boost Regression
  * models on data pulled in using Mongo's Spark Connector.
  */
-public class GBoostRegressionModel{
+public class GBoostRegressionExhaustiveModel {
+
+    private String filename="";
 
     private Dataset<Row> mongoCollection;
     // DATABASE PARAMETERS
-    protected static final Logger log = LogManager.getLogger(GBoostRegressionModel.class);
+    protected static final Logger log = LogManager.getLogger(GBoostRegressionExhaustiveModel.class);
     private String database, collection, mongoUri;
     private String[] features;
     private String label, gisJoin;
@@ -177,12 +180,13 @@ public class GBoostRegressionModel{
         this.trainSplit = trainSplit;
     }
 
-    public GBoostRegressionModel(String mongoUri, String database, String collection, String gisJoin) {
+    public GBoostRegressionExhaustiveModel(String mongoUri, String database, String collection, String gisJoin) {
         log.info("Gradient Boosting constructor invoked");
         setMongoUri(mongoUri);
         setDatabase(database);
         setCollection(collection);
         setGisjoin(gisJoin);
+        filename = "parents/"+gisJoin+".txt";
     }
 
     public String getDatabase() {
@@ -298,13 +302,14 @@ public class GBoostRegressionModel{
         return JavaConverters.asScalaIteratorConverter(inputList.iterator()).asScala().toSeq();
     }
 
-    private void fancy_logging(String msg){
+    private String fancy_logging(String msg){
 
         String logStr = "\n============================================================================================================\n";
         logStr+=msg;
         logStr+="\n============================================================================================================";
 
         log.info(logStr);
+        return logStr;
     }
 
     private double calc_interval(double startTime) {
@@ -318,18 +323,24 @@ public class GBoostRegressionModel{
         //addClusterDependencyJars(sparkContext);
         double startTime = System.currentTimeMillis();
 
-        fancy_logging("Initiating Gradient Boost Modelling...");
+        String msg = "";
+        msg = "Initiating Gradient Boost Modelling...";
+        fancy_logging(msg);
+        FancyLogger.write_out(msg, filename);
 
         // Select just the columns we want, discard the rest
         Dataset<Row> selected = mongoCollection.select("_id", desiredColumns());
 
-        fancy_logging("Data Fetch Completed in "+ calc_interval(startTime)+" secs");
+        msg = "Data Fetch Completed in "+ calc_interval(startTime)+" secs";
+        //fancy_logging(msg);
+        FancyLogger.write_out(fancy_logging(msg), filename);
         startTime = System.currentTimeMillis();
 
         Dataset<Row> gisDataset = selected.filter(selected.col(queryField).equalTo(gisJoin))
                 .withColumnRenamed(this.label, "label"); // Rename the chosen label column to "label"
 
-        log.info("DATA TYPES: \n"+Arrays.toString(gisDataset.columns())+" "+gisDataset.dtypes());
+        //gisDataset = gisDataset.sample(0.1);
+        //log.info("DATA TYPES: \n"+Arrays.toString(gisDataset.columns())+" "+gisDataset.dtypes());
 
         // Create a VectorAssembler to assemble all the feature columns into a single column vector named "features"
         VectorAssembler vectorAssembler = new VectorAssembler()
@@ -344,7 +355,10 @@ public class GBoostRegressionModel{
         Dataset<Row> trainrdd = rds[0].persist(StorageLevel.MEMORY_ONLY());
         Dataset<Row> testrdd = rds[1];
 
-        fancy_logging("Data Manipulation completed in "+calc_interval(startTime)+" secs"/*+"\nData Size: "+gisDataset.count()*/);
+        msg = "Data Manipulation completed in "+calc_interval(startTime)+" secs"/*+"\nData Size: "+gisDataset.count()*/;
+        //fancy_logging(msg);
+        FancyLogger.write_out(fancy_logging(msg), filename);
+
         startTime = System.currentTimeMillis();
 
         GBTRegressor gb = new GBTRegressor().setFeaturesCol("features").setLabelCol("label");
@@ -352,22 +366,53 @@ public class GBoostRegressionModel{
         // POPULATING USER PARAMETERS
         ingestParameters(gb);
 
-        GBTRegressionModel gbModel = gb.fit(trainrdd);
 
-        fancy_logging("Model Training completed in "+calc_interval(startTime));
+        // We use a ParamGridBuilder to construct a grid of parameters to search over.
+        // With 3 values for tolerance, 3 values for regularization param, and 3 values for epsilon,
+        // this grid will have 3 x 4 x 3 = 36 parameter settings for CrossValidator to choose from.
+        ParamMap[] paramGrid = new ParamGridBuilder()
+                .addGrid(gb.maxBins(), new int[]{32, 50, 100})
+                .addGrid(gb.maxDepth(), new int[]{3, 4, 5})
+                .addGrid(gb.maxIter(), new int[]{10, 15, 20})
+                .build();
+
+        // Establish a Regression Evaluator for RMSE
+        RegressionEvaluator evaluator = new RegressionEvaluator().setMetricName("rmse");
+
+        // We now treat the Pipeline as an Estimator, wrapping it in a CrossValidator instance.
+        // This will allow us to jointly choose parameters for all Pipeline stages.
+        // A CrossValidator requires an Estimator, a set of Estimator ParamMaps, and an Evaluator.
+        // Note that the evaluator here is a BinaryClassificationEvaluator and its default metric
+        // is areaUnderROC.
+        CrossValidator crossValidator = new CrossValidator()
+                .setEstimator(gb)
+                .setEvaluator(evaluator)
+                .setEstimatorParamMaps(paramGrid)
+                .setNumFolds(3)     // Use 3+ in practice
+                .setParallelism(2);
+
+        CrossValidatorModel crossValidatorModel = crossValidator.fit(trainrdd);
+        GBTRegressionModel bestGBModel = (GBTRegressionModel) crossValidatorModel.bestModel();
+
+        msg = "Exhaustive Model Training For "+gisJoin+" completed in "+calc_interval(startTime);
+        //fancy_logging(msg);
+        FancyLogger.write_out(fancy_logging(msg), filename);
+
         startTime = System.currentTimeMillis();
 
-        Dataset<Row> pred_pair = gbModel.transform(testrdd).select("label", "prediction").cache();
+        Dataset<Row> pred_pair = bestGBModel.transform(testrdd).select("label", "prediction").cache();
 
         RegressionMetrics metrics = new RegressionMetrics(pred_pair);
 
         this.rmse = metrics.rootMeanSquaredError();
-        this.r2 = metrics.r2();
-        fancy_logging("Model Testing/Loss Computation completed in "+calc_interval(startTime)+"\nEVALUATIONS: RMSE, R2: "+rmse+" "+r2);
+        //this.r2 = metrics.r2();
+        msg = "Model Testing/Loss Computation For "+gisJoin+" completed in "+calc_interval(startTime)+"\nEVALUATIONS: RMSE, R2: "+rmse+" "+r2;
+        //fancy_logging(msg);
+        FancyLogger.write_out(fancy_logging(msg), filename);
 
         logModelResults();
         this.trained_gb = gb;
-        this.trained_gbModel = gbModel;
+        this.trained_gbModel = bestGBModel;
         return true;
     }
 
@@ -466,7 +511,7 @@ public class GBoostRegressionModel{
         JavaSparkContext sparkContext = new JavaSparkContext(sparkSession.sparkContext());
         ReadConfig readConfig = ReadConfig.create(sparkContext);
 
-        GBoostRegressionModel gbModel = new GBoostRegressionModel(
+        GBoostRegressionExhaustiveModel gbModel = new GBoostRegressionExhaustiveModel(
                 "mongodb://lattice-46:27017", "sustaindb", collection_name, gisJoins);
         gbModel.setMongoCollection(MongoSpark.load(sparkContext, readConfig).toDF());
         gbModel.populateTest();

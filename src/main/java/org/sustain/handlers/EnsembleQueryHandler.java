@@ -30,22 +30,19 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.ml.feature.*;
-import org.apache.spark.ml.linalg.DenseMatrix;
 import org.apache.spark.ml.linalg.DenseVector;
+import org.apache.spark.ml.regression.GBTRegressionModel;
+import org.apache.spark.ml.regression.RandomForestRegressionModel;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
-import org.sustain.*;
 import org.sustain.Collection;
-import org.sustain.SparkTask;
-import org.sustain.modeling.GBoostRegressionModel;
-import org.sustain.modeling.RFRegressionModel;
+import org.sustain.*;
+import org.sustain.modeling.*;
 import org.sustain.util.Constants;
-import org.sustain.SparkManager;
+import org.sustain.util.CountyClusters;
 import org.sustain.util.FancyLogger;
 import scala.Tuple2;
 import scala.collection.Iterator;
-import scala.collection.JavaConverters;
-import scala.collection.Seq;
 
 import java.util.*;
 import java.util.concurrent.Future;
@@ -55,6 +52,13 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
     private static final double targetVariance = 0.95;
     private static final double samplingPercentage = 0.0003;
     private static final Logger log = LogManager.getLogger(EnsembleQueryHandler.class);
+    private String filename = "driver.txt";
+
+    public static void main(String arg[]) {
+
+        Map<String, List> opMap = CountyClusters.extractCountyGroups("./src/main/java/org/sustain/handlers/clusters.csv");
+        System.out.println(opMap);
+    }
 
     public EnsembleQueryHandler(ModelRequest request, StreamObserver<ModelResponse> responseObserver, SparkManager sparkManager) {
         super(request, responseObserver, sparkManager);
@@ -84,12 +88,29 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
         private final RForestRegressionRequest rfRequest;
         private final Collection requestCollection;
         private final List<String> gisJoins;
+        private Map<String, RandomForestRegressionModel> trained_parents;
+        private Map<String, String> reverseChildToParentMap = null;
+        private Map<String, Double> parentRmse = null;
 
-        RFRegressionTask(ModelRequest modelRequest, List<String> gisJoins) {
+        RFRegressionTask(ModelRequest modelRequest, List<String> gisJoins, Map<String, Double> parentRmse, Map<String, RandomForestRegressionModel> trained_parents) {
             this.rfRequest = modelRequest.getRForestRegressionRequest();
             this.requestCollection = modelRequest.getCollections(0); // We only support 1 collection currently
             this.gisJoins = gisJoins;
+            this.trained_parents = trained_parents;
+            this.parentRmse = parentRmse;
         }
+
+        RFRegressionTask(ModelRequest modelRequest, List<String> gisJoins, Map<String, RandomForestRegressionModel> trained_parents,
+                         Map<String, Double> parentRmse, Map<String, String> reverseChildToParentMap) {
+            this.rfRequest = modelRequest.getRForestRegressionRequest();
+            this.requestCollection = modelRequest.getCollections(0); // We only support 1 collection currently
+            this.gisJoins = gisJoins;
+            this.trained_parents = trained_parents;
+            this.parentRmse = parentRmse;
+            this.reverseChildToParentMap = reverseChildToParentMap;
+        }
+
+
 
         @Override
         public List<ModelResponse> execute(JavaSparkContext sparkContext) throws Exception {
@@ -110,133 +131,139 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
             // FETCHING MONGO COLLECTION ONCE FOR ALL MODELS
             Dataset<Row> mongocollection = MongoSpark.load(sparkContext, readConfig).toDF();
 
-            // THE FEATURES THAT NEED COMPRESSING
-            // WORK WITH ALL FEATURES FOR NOW
-            List<String> allFeaturesList = new ArrayList<String>();
-
-            String colnInfo = "";
-
-            for(Tuple2<String,String> dataType: mongocollection.dtypes()) {
-                colnInfo+= dataType._1+" "+dataType._2+"\n";
-                if (!(dataType._2.toLowerCase().contains("string"))) {
-                    allFeaturesList.add(dataType._1);
-                }
-            }
-
-            // THE FEATURES THAT NEED COMPRESSING
-            // WORK WITH ALL FEATURES FOR NOW
-            String[] allFeatures = allFeaturesList.toArray(new String[0]);
-            FancyLogger.fancy_logging("ALL FEATURES: "+Arrays.asList(allFeatures)+"\n"+colnInfo, log);
-            //*****************PCA START************************************
-
-            // Dropping rows with null values
-            Dataset<Row> selectedFeatures = mongocollection.sample(samplingPercentage);
-            selectedFeatures = selectedFeatures.na().drop();
-
-            FancyLogger.fancy_logging("FINISHED SAMPLING: "+Arrays.asList(allFeatures), log);
-
-            // Assembling
-            VectorAssembler assembler = new VectorAssembler().setInputCols(allFeatures).setOutputCol("features");
-            Dataset<Row> featureDF = assembler.transform(selectedFeatures);
-            featureDF.show(10);
-
-            // Scaling
-            log.info("Normalizing features");
-            StandardScaler scaler = new StandardScaler()
-                    .setInputCol("features")
-                    .setOutputCol("normalized_features");
-            StandardScalerModel scalerModel = scaler.fit(featureDF);
-
-            featureDF = scalerModel.transform(featureDF);
-            featureDF = featureDF.drop("features");
-            featureDF = featureDF.withColumnRenamed("normalized_features", "features");
-
-            log.info("Dataframe after normalizing with StandardScaler");
-            //featureDF.show(10);
-
-            //featureDF = featureDF.sample(samplingPercentage);
-
-            // PCA
-            long pcaTime1 = System.currentTimeMillis();
-            PCAModel pca = new PCA()
-                    .setInputCol("features")
-                    .setOutputCol("pcaFeatures")
-                    .setK(7)
-                    .fit(featureDF);
-
-            Dataset<Row> pcaDF = pca.transform(featureDF).select("features", "pcaFeatures");
-            long pcaTime2 = System.currentTimeMillis();
-
-            //pcaDF.write().json("sustain-pcaDF.json");
-            int requiredNoOfPCs = getNoOfPrincipalComponentsByVariance(pca, 0.95);
-            log.info("requiredNoOfPCs: {}", requiredNoOfPCs);
-
-            pcaDF.show(10);
-            //*****************PCA STOP*************************************
-
-            if(allFeatures.length > 0) {
-                FancyLogger.fancy_logging("PCA COMPLETE", log);
-                return null;
-            }
-
             List<ModelResponse> modelResponses = new ArrayList<>();
 
             for (String gisJoin : this.gisJoins) {
-                RFRegressionModel model = new RFRegressionModel(mongoUri, dbName, collection.getName(),
-                        gisJoin);
 
-                model.setMongoCollection(mongocollection);
-                // Set parameters of Random Forest Regression Model
+                // TRAINING PARENTS
+                if (reverseChildToParentMap == null) {
+                    RFRegressionExhaustiveModel model = new RFRegressionExhaustiveModel(mongoUri, dbName, collection.getName(),
+                            gisJoin);
 
-                int featuresCount = collection.getFeaturesCount();
-                String[] features = new String[featuresCount];
-                for (int i = 0; i < featuresCount; i++) {
-                    features[i] = collection.getFeatures(i);
-                }
+                    model.setMongoCollection(mongocollection);
+                    // Set parameters of Random Forest Regression Model
 
-                model.setFeatures(features);
-                model.setLabel(collection.getLabel());
-                model.setBootstrap(rfRequest.getIsBootstrap());
+                    int featuresCount = collection.getFeaturesCount();
+                    String[] features = new String[featuresCount];
+                    for (int i = 0; i < featuresCount; i++) {
+                        features[i] = collection.getFeatures(i);
+                    }
 
-                // CHECKING FOR VALID MODEL PARAMETER VALUES
-                if (rfRequest.getSubsamplingRate() > 0 && rfRequest.getSubsamplingRate() <= 1)
-                    model.setSubsamplingRate(rfRequest.getSubsamplingRate());
-                if (rfRequest.getNumTrees() > 0)
-                    model.setNumTrees(rfRequest.getNumTrees());
-                if (rfRequest.getFeatureSubsetStrategy() != null && !rfRequest.getFeatureSubsetStrategy().isEmpty())
-                    model.setFeatureSubsetStrategy(rfRequest.getFeatureSubsetStrategy());
-                if (rfRequest.getImpurity() != null && !rfRequest.getImpurity().isEmpty())
-                    model.setImpurity(rfRequest.getImpurity());
-                if (rfRequest.getMaxDepth() > 0)
-                    model.setMaxDepth(rfRequest.getMaxDepth());
-                if (rfRequest.getMaxBins() > 0)
-                    model.setMaxBins(rfRequest.getMaxBins());
-                if (rfRequest.getTrainSplit() > 0 && rfRequest.getTrainSplit() < 1)
-                    model.setTrainSplit(rfRequest.getTrainSplit());
-                if (rfRequest.getMinInfoGain() > 0)
-                    model.setMinInfoGain(rfRequest.getMinInfoGain());
-                if (rfRequest.getMinInstancesPerNode() >= 1)
-                    model.setMinInstancesPerNode(rfRequest.getMinInstancesPerNode());
-                if (rfRequest.getMinWeightFractionPerNode() >= 0.0 && rfRequest.getMinWeightFractionPerNode() < 0.5)
-                    model.setMinWeightFractionPerNode(rfRequest.getMinWeightFractionPerNode());
+                    model.setFeatures(features);
+                    model.setLabel(collection.getLabel());
+                    model.setBootstrap(rfRequest.getIsBootstrap());
+
+                    // CHECKING FOR VALID MODEL PARAMETER VALUES
+                    if (rfRequest.getSubsamplingRate() > 0 && rfRequest.getSubsamplingRate() <= 1)
+                        model.setSubsamplingRate(rfRequest.getSubsamplingRate());
+                    if (rfRequest.getNumTrees() > 0)
+                        model.setNumTrees(rfRequest.getNumTrees());
+                    if (rfRequest.getFeatureSubsetStrategy() != null && !rfRequest.getFeatureSubsetStrategy().isEmpty())
+                        model.setFeatureSubsetStrategy(rfRequest.getFeatureSubsetStrategy());
+                    if (rfRequest.getImpurity() != null && !rfRequest.getImpurity().isEmpty())
+                        model.setImpurity(rfRequest.getImpurity());
+                    if (rfRequest.getMaxDepth() > 0)
+                        model.setMaxDepth(rfRequest.getMaxDepth());
+                    if (rfRequest.getMaxBins() > 0)
+                        model.setMaxBins(rfRequest.getMaxBins());
+                    if (rfRequest.getTrainSplit() > 0 && rfRequest.getTrainSplit() < 1)
+                        model.setTrainSplit(rfRequest.getTrainSplit());
+                    if (rfRequest.getMinInfoGain() > 0)
+                        model.setMinInfoGain(rfRequest.getMinInfoGain());
+                    if (rfRequest.getMinInstancesPerNode() >= 1)
+                        model.setMinInstancesPerNode(rfRequest.getMinInstancesPerNode());
+                    if (rfRequest.getMinWeightFractionPerNode() >= 0.0 && rfRequest.getMinWeightFractionPerNode() < 0.5)
+                        model.setMinWeightFractionPerNode(rfRequest.getMinWeightFractionPerNode());
 
 
-                // Submit task to Spark Manager
-                boolean ok = model.train();
+                    // Submit task to Spark Manager
+                    boolean ok = model.train();
 
-                if (ok) {
+                    if (ok) {
 
-                    RForestRegressionResponse rsp = RForestRegressionResponse.newBuilder()
-                            .setGisJoin(model.getGisJoin())
-                            .setRmse(model.getRmse())
-                            .setR2(model.getR2())
-                            .build();
+                        synchronized (this) {
+                            trained_parents.put(gisJoin, model.getTrained_rfModel());
+                            parentRmse.put(gisJoin,model.getRmse());
+                        }
 
-                    modelResponses.add(ModelResponse.newBuilder()
-                            .setRForestRegressionResponse(rsp)
-                            .build());
+                        RForestRegressionResponse rsp = RForestRegressionResponse.newBuilder()
+                                .setGisJoin(model.getGisJoin())
+                                .setRmse(model.getRmse())
+                                .setR2(model.getR2())
+                                .build();
+
+                        modelResponses.add(ModelResponse.newBuilder()
+                                .setRForestRegressionResponse(rsp)
+                                .build());
+                    } else {
+                        log.info("Ran into a problem building a model for GISJoin {}, skipping.", gisJoin);
+                    }
                 } else {
-                    log.info("Ran into a problem building a model for GISJoin {}, skipping.", gisJoin);
+                    // TRAINING CHILDREN
+                    RFChildIncrementalModel model = new RFChildIncrementalModel(mongoUri, dbName, collection.getName(),
+                            gisJoin);
+
+                    String parentGisJoin = reverseChildToParentMap.get(gisJoin);
+                    RandomForestRegressionModel parentRegressionModel = trained_parents.get(parentGisJoin);
+                    double targetRMSE = parentRmse.get(parentGisJoin);
+                    model.setParent_rfModel(parentRegressionModel);
+                    model.setParent_rmse(targetRMSE);
+                    model.parentGisJoin = parentGisJoin;
+                    model.setFilename();
+
+                    model.setMongoCollection(mongocollection);
+                    // Set parameters of Random Forest Regression Model
+
+                    int featuresCount = collection.getFeaturesCount();
+                    String[] features = new String[featuresCount];
+                    for (int i = 0; i < featuresCount; i++) {
+                        features[i] = collection.getFeatures(i);
+                    }
+
+                    model.setFeatures(features);
+                    model.setLabel(collection.getLabel());
+                    model.setBootstrap(rfRequest.getIsBootstrap());
+
+                    // CHECKING FOR VALID MODEL PARAMETER VALUES
+                    if (rfRequest.getSubsamplingRate() > 0 && rfRequest.getSubsamplingRate() <= 1)
+                        model.setSubsamplingRate(rfRequest.getSubsamplingRate());
+                    if (rfRequest.getNumTrees() > 0)
+                        model.setNumTrees(rfRequest.getNumTrees());
+                    if (rfRequest.getFeatureSubsetStrategy() != null && !rfRequest.getFeatureSubsetStrategy().isEmpty())
+                        model.setFeatureSubsetStrategy(rfRequest.getFeatureSubsetStrategy());
+                    if (rfRequest.getImpurity() != null && !rfRequest.getImpurity().isEmpty())
+                        model.setImpurity(rfRequest.getImpurity());
+                    if (rfRequest.getMaxDepth() > 0)
+                        model.setMaxDepth(rfRequest.getMaxDepth());
+                    if (rfRequest.getMaxBins() > 0)
+                        model.setMaxBins(rfRequest.getMaxBins());
+                    if (rfRequest.getTrainSplit() > 0 && rfRequest.getTrainSplit() < 1)
+                        model.setTrainSplit(rfRequest.getTrainSplit());
+                    if (rfRequest.getMinInfoGain() > 0)
+                        model.setMinInfoGain(rfRequest.getMinInfoGain());
+                    if (rfRequest.getMinInstancesPerNode() >= 1)
+                        model.setMinInstancesPerNode(rfRequest.getMinInstancesPerNode());
+                    if (rfRequest.getMinWeightFractionPerNode() >= 0.0 && rfRequest.getMinWeightFractionPerNode() < 0.5)
+                        model.setMinWeightFractionPerNode(rfRequest.getMinWeightFractionPerNode());
+
+
+                    // Submit task to Spark Manager
+                    boolean ok = model.train();
+
+                    if (ok) {
+
+                        RForestRegressionResponse rsp = RForestRegressionResponse.newBuilder()
+                                .setGisJoin(model.getGisJoin())
+                                .setRmse(model.getRmse())
+                                .setR2(model.getR2())
+                                .build();
+
+                        modelResponses.add(ModelResponse.newBuilder()
+                                .setRForestRegressionResponse(rsp)
+                                .build());
+                    } else {
+                        log.info("Ran into a problem building a model for GISJoin {}, skipping.", gisJoin);
+                    }
                 }
             }
             return modelResponses;
@@ -248,11 +275,27 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
         private final GBoostRegressionRequest gbRequest;
         private final Collection requestCollection;
         private final List<String> gisJoins;
+        private Map<String, GBTRegressionModel> trained_parents;
+        private Map<String, String> reverseChildToParentMap = null;
+        private Map<String, Double> parentRmse = null;
 
-        GBRegressionTask(ModelRequest modelRequest, List<String> gisJoins) {
+        GBRegressionTask(ModelRequest modelRequest, List<String> gisJoins, Map<String, Double> parentRmse, Map<String, GBTRegressionModel> trained_parents) {
             this.gbRequest = modelRequest.getGBoostRegressionRequest();
             this.requestCollection = modelRequest.getCollections(0); // We only support 1 collection currently
             this.gisJoins = gisJoins;
+            this.trained_parents = trained_parents;
+            this.parentRmse = parentRmse;
+        }
+
+
+        GBRegressionTask(ModelRequest modelRequest, List<String> gisJoins, Map<String, GBTRegressionModel> trained_parents,
+                         Map<String, Double> parentRmse, Map<String, String> reverseChildToParentMap) {
+            this.gbRequest = modelRequest.getGBoostRegressionRequest();
+            this.requestCollection = modelRequest.getCollections(0); // We only support 1 collection currently
+            this.gisJoins = gisJoins;
+            this.trained_parents = trained_parents;
+            this.reverseChildToParentMap = reverseChildToParentMap;
+            this.parentRmse = parentRmse;
         }
 
         @Override
@@ -274,142 +317,143 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
             // FETCHING MONGO COLLECTION ONCE FOR ALL MODELS
             Dataset<Row> mongocollection = MongoSpark.load(sparkContext, readConfig).toDF();
 
-            // THE FEATURES THAT NEED COMPRESSING
-            // WORK WITH ALL FEATURES FOR NOW
-            /*List<String> allFeaturesList = new ArrayList<String>();
-
-
-
-            String colnInfo = "";
-
-            for(Tuple2<String,String> dataType: mongocollection.dtypes()) {
-                colnInfo+= dataType._1+" "+dataType._2+"\n";
-                if (!(dataType._2.toLowerCase().contains("string"))) {
-                    allFeaturesList.add(dataType._1);
-                }
-            }
-            String[] allFeatures = allFeaturesList.toArray(new String[0]);*/
-
-            String[] allFeatures = {"max_eastward_wind","max_max_air_temperature","max_min_air_temperature","max_northward_wind",
-                    "max_precipitation","max_specific_humidity","max_surface_downwelling_shortwave_flux_in_air","max_vpd","min_eastward_wind",
-                    "min_max_air_temperature","min_min_air_temperature","min_northward_wind","min_precipitation","min_specific_humidity",
-                    "min_surface_downwelling_shortwave_flux_in_air","min_vpd","timestamp"};
-
-            FancyLogger.fancy_logging("ALL FEATURES: "+Arrays.asList(allFeatures), log);
-            //*****************PCA START************************************
-
-            // Dropping rows with null values
-            Dataset<Row> selectedFeatures = mongocollection.sample(samplingPercentage);
-            selectedFeatures = selectedFeatures.na().drop();
-
-            FancyLogger.fancy_logging("FINISHED SAMPLING: "+Arrays.asList(allFeatures), log);
-            // Assembling
-            VectorAssembler assembler = new VectorAssembler().setInputCols(allFeatures).setOutputCol("features");
-            Dataset<Row> featureDF = assembler.transform(selectedFeatures);
-            //featureDF.show(10);
-
-            // Scaling
-            log.info("Normalizing features");
-            StandardScaler scaler = new StandardScaler()
-                    .setInputCol("features")
-                    .setOutputCol("normalized_features");
-            StandardScalerModel scalerModel = scaler.fit(featureDF);
-
-            featureDF = scalerModel.transform(featureDF);
-            featureDF = featureDF.drop("features");
-            featureDF = featureDF.withColumnRenamed("normalized_features", "features");
-
-            log.info("Dataframe after normalizing with StandardScaler");
-            //featureDF.show(10);
-
-            featureDF = featureDF.sample(samplingPercentage);
-
-            // PCA
-            long pcaTime1 = System.currentTimeMillis();
-
-            FancyLogger.fancy_logging("STARTING PCA",log);
-            PCAModel pca = new PCA()
-                    .setInputCol("features")
-                    .setOutputCol("pcaFeatures")
-                    .setK(7)
-                    .fit(featureDF);
-
-            Dataset<Row> pcaDF = pca.transform(featureDF).select("features", "pcaFeatures");
-            //pcaDF.write().json("sustain-pcaDF.json");
-            FancyLogger.fancy_logging("FINISHED PCA",log);
-            int requiredNoOfPCs = getNoOfPrincipalComponentsByVariance(pca, 0.95);
-            log.info("requiredNoOfPCs: {}", requiredNoOfPCs);
-
-            FancyLogger.fancy_logging("EXTRACTED PCs",log);
-            pcaDF.show(10);
-            //*****************PCA STOP*************************************
-
-            if(allFeatures.length > 0) {
-                FancyLogger.fancy_logging("PCA COMPLETE", log);
-                return null;
-            }
-
-
             List<ModelResponse> modelResponses = new ArrayList<>();
 
             for (String gisJoin : this.gisJoins) {
-                GBoostRegressionModel model = new GBoostRegressionModel(mongoUri, dbName, collection.getName(),
-                        gisJoin);
 
-                model.setMongoCollection(mongocollection);
-                // Set parameters of Random Forest Regression Model
+                // TRAINING PARENTS
+                if (reverseChildToParentMap == null) {
+                    //GBoostRegressionModel model = new GBoostRegressionModel(mongoUri, dbName, collection.getName(), gisJoin);
+                    GBoostRegressionExhaustiveModel model = new GBoostRegressionExhaustiveModel(mongoUri, dbName, collection.getName(), gisJoin);
 
-                int featuresCount = collection.getFeaturesCount();
-                String[] features = new String[featuresCount];
-                for (int i = 0; i < featuresCount; i++) {
-                    features[i] = collection.getFeatures(i);
-                }
+                    model.setMongoCollection(mongocollection);
+                    // Set parameters of Random Forest Regression Model
 
-                model.setFeatures(features);
-                model.setLabel(collection.getLabel());
+                    int featuresCount = collection.getFeaturesCount();
+                    String[] features = new String[featuresCount];
+                    for (int i = 0; i < featuresCount; i++) {
+                        features[i] = collection.getFeatures(i);
+                    }
 
-                if (gbRequest.getLossType() != null && !gbRequest.getLossType().isEmpty())
-                    model.setLossType(gbRequest.getLossType());
-                if (gbRequest.getMaxIter() > 0)
-                    model.setMaxIter(gbRequest.getMaxIter());
-                if (gbRequest.getSubsamplingRate() > 0 && gbRequest.getSubsamplingRate() <= 1)
-                    model.setSubsamplingRate(gbRequest.getSubsamplingRate());
-                if (gbRequest.getStepSize() > 0 && gbRequest.getStepSize() <= 1)
-                    model.setStepSize(gbRequest.getStepSize());
-                if (gbRequest.getFeatureSubsetStrategy() != null && !gbRequest.getFeatureSubsetStrategy().isEmpty())
-                    model.setFeatureSubsetStrategy(gbRequest.getFeatureSubsetStrategy());
-                if (gbRequest.getImpurity() != null && !gbRequest.getImpurity().isEmpty())
-                    model.setImpurity(gbRequest.getImpurity());
-                if (gbRequest.getMaxDepth() > 0)
-                    model.setMaxDepth(gbRequest.getMaxDepth());
-                if (gbRequest.getMaxBins() > 0)
-                    model.setMaxBins(gbRequest.getMaxBins());
-                if (gbRequest.getTrainSplit() > 0)
-                    model.setTrainSplit(gbRequest.getTrainSplit());
-                if (gbRequest.getMinInfoGain() > 0)
-                    model.setMinInfoGain(gbRequest.getMinInfoGain());
-                if (gbRequest.getMinInstancesPerNode() >= 1)
-                    model.setMinInstancesPerNode(gbRequest.getMinInstancesPerNode());
-                if (gbRequest.getMinWeightFractionPerNode() >= 0.0 && gbRequest.getMinWeightFractionPerNode() < 0.5)
-                    model.setMinWeightFractionPerNode(gbRequest.getMinWeightFractionPerNode());
+                    model.setFeatures(features);
+                    model.setLabel(collection.getLabel());
+
+                    if (gbRequest.getLossType() != null && !gbRequest.getLossType().isEmpty())
+                        model.setLossType(gbRequest.getLossType());
+                    if (gbRequest.getMaxIter() > 0)
+                        model.setMaxIter(gbRequest.getMaxIter());
+                    if (gbRequest.getSubsamplingRate() > 0 && gbRequest.getSubsamplingRate() <= 1)
+                        model.setSubsamplingRate(gbRequest.getSubsamplingRate());
+                    if (gbRequest.getStepSize() > 0 && gbRequest.getStepSize() <= 1)
+                        model.setStepSize(gbRequest.getStepSize());
+                    if (gbRequest.getFeatureSubsetStrategy() != null && !gbRequest.getFeatureSubsetStrategy().isEmpty())
+                        model.setFeatureSubsetStrategy(gbRequest.getFeatureSubsetStrategy());
+                    if (gbRequest.getImpurity() != null && !gbRequest.getImpurity().isEmpty())
+                        model.setImpurity(gbRequest.getImpurity());
+                    if (gbRequest.getMaxDepth() > 0)
+                        model.setMaxDepth(gbRequest.getMaxDepth());
+                    if (gbRequest.getMaxBins() > 0)
+                        model.setMaxBins(gbRequest.getMaxBins());
+                    if (gbRequest.getTrainSplit() > 0)
+                        model.setTrainSplit(gbRequest.getTrainSplit());
+                    if (gbRequest.getMinInfoGain() > 0)
+                        model.setMinInfoGain(gbRequest.getMinInfoGain());
+                    if (gbRequest.getMinInstancesPerNode() >= 1)
+                        model.setMinInstancesPerNode(gbRequest.getMinInstancesPerNode());
+                    if (gbRequest.getMinWeightFractionPerNode() >= 0.0 && gbRequest.getMinWeightFractionPerNode() < 0.5)
+                        model.setMinWeightFractionPerNode(gbRequest.getMinWeightFractionPerNode());
 
 
-                // Submit task to Spark Manager
-                boolean ok = model.train();
+                    // Submit task to Spark Manager
+                    boolean ok = model.train();
 
-                if (ok) {
+                    if (ok) {
+                        synchronized (this) {
+                            trained_parents.put(gisJoin, model.getTrained_gbModel());
+                            parentRmse.put(gisJoin,model.getRmse());
+                        }
 
-                    RForestRegressionResponse rsp = RForestRegressionResponse.newBuilder()
-                            .setGisJoin(model.getGisJoin())
-                            .setRmse(model.getRmse())
-                            .setR2(model.getR2())
-                            .build();
+                        GBoostRegressionResponse rsp = GBoostRegressionResponse.newBuilder()
+                                .setGisJoin(model.getGisJoin())
+                                .setRmse(model.getRmse())
+                                .setR2(model.getR2())
+                                .build();
 
-                    modelResponses.add(ModelResponse.newBuilder()
-                            .setRForestRegressionResponse(rsp)
-                            .build());
+                        modelResponses.add(ModelResponse.newBuilder()
+                                .setGBoostRegressionResponse(rsp)
+                                .build());
+                    } else {
+                        log.info("Ran into a problem building a model for GISJoin {}, skipping.", gisJoin);
+                    }
                 } else {
-                    log.info("Ran into a problem building a model for GISJoin {}, skipping.", gisJoin);
+                    // TRAINING CHILDREN
+
+                    GBoostChildIncrementalModel model = new GBoostChildIncrementalModel(mongoUri, dbName, collection.getName(), gisJoin);
+
+                    String parentGisJoin = reverseChildToParentMap.get(gisJoin);
+                    GBTRegressionModel parentRegressionModel = trained_parents.get(parentGisJoin);
+                    double targetRMSE = parentRmse.get(parentGisJoin);
+                    model.setParent_gbModel(parentRegressionModel);
+                    model.setParent_rmse(targetRMSE);
+                    model.parentGisJoin = parentGisJoin;
+                    model.setFilename();
+
+                    model.setMongoCollection(mongocollection);
+                    // Set parameters of Random Forest Regression Model
+
+                    int featuresCount = collection.getFeaturesCount();
+                    String[] features = new String[featuresCount];
+                    for (int i = 0; i < featuresCount; i++) {
+                        features[i] = collection.getFeatures(i);
+                    }
+
+                    model.setFeatures(features);
+                    model.setLabel(collection.getLabel());
+
+                    if (gbRequest.getLossType() != null && !gbRequest.getLossType().isEmpty())
+                        model.setLossType(gbRequest.getLossType());
+                    if (gbRequest.getMaxIter() > 0)
+                        model.setMaxIter(gbRequest.getMaxIter());
+                    if (gbRequest.getSubsamplingRate() > 0 && gbRequest.getSubsamplingRate() <= 1)
+                        model.setSubsamplingRate(gbRequest.getSubsamplingRate());
+                    if (gbRequest.getStepSize() > 0 && gbRequest.getStepSize() <= 1)
+                        model.setStepSize(gbRequest.getStepSize());
+                    if (gbRequest.getFeatureSubsetStrategy() != null && !gbRequest.getFeatureSubsetStrategy().isEmpty())
+                        model.setFeatureSubsetStrategy(gbRequest.getFeatureSubsetStrategy());
+                    if (gbRequest.getImpurity() != null && !gbRequest.getImpurity().isEmpty())
+                        model.setImpurity(gbRequest.getImpurity());
+                    if (gbRequest.getMaxDepth() > 0)
+                        model.setMaxDepth(gbRequest.getMaxDepth());
+                    if (gbRequest.getMaxBins() > 0)
+                        model.setMaxBins(gbRequest.getMaxBins());
+                    if (gbRequest.getTrainSplit() > 0)
+                        model.setTrainSplit(gbRequest.getTrainSplit());
+                    if (gbRequest.getMinInfoGain() > 0)
+                        model.setMinInfoGain(gbRequest.getMinInfoGain());
+                    if (gbRequest.getMinInstancesPerNode() >= 1)
+                        model.setMinInstancesPerNode(gbRequest.getMinInstancesPerNode());
+                    if (gbRequest.getMinWeightFractionPerNode() >= 0.0 && gbRequest.getMinWeightFractionPerNode() < 0.5)
+                        model.setMinWeightFractionPerNode(gbRequest.getMinWeightFractionPerNode());
+
+
+                    // Submit task to Spark Manager
+                    boolean ok = model.train();
+
+                    if (ok) {
+
+                        GBoostRegressionResponse rsp = GBoostRegressionResponse.newBuilder()
+                                .setGisJoin(model.getGisJoin())
+                                .setRmse(model.getRmse())
+                                .setR2(model.getR2())
+                                .build();
+
+                        modelResponses.add(ModelResponse.newBuilder()
+                                .setGBoostRegressionResponse(rsp)
+                                .build());
+                    } else {
+                        log.info("Ran into a problem building a model for GISJoin {}, skipping.", gisJoin);
+                    }
+
                 }
             }
             return modelResponses;
@@ -462,42 +506,227 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
 
     @Override
     public void handleRequest() {
+
+        String full_log_string = "";
         if (isValid(this.request)) {
 
+            // PARSE THE CLUSTER CSV
+            Map<String, List> clusterCSVMap = CountyClusters.extractCountyGroups("./src/main/java/org/sustain/handlers/clusters_mid.csv");
+            full_log_string+=FancyLogger.fancy_logging("CLUSTER_MAP: "+clusterCSVMap, null);
             if (request.getType().equals(ModelType.R_FOREST_REGRESSION)) {
-                try {
-                    RForestRegressionRequest req = this.request.getRForestRegressionRequest();
+                {
 
-                    List<List<String>> gisJoinBatches = batchGisJoins(req.getGisJoinsList(), 20);
+                    try {
+                        RForestRegressionRequest req = this.request.getRForestRegressionRequest();
 
-                    List<Future<List<ModelResponse>>> batchedModelTasks = new ArrayList<>();
-                    for (List<String> gisJoinBatch: gisJoinBatches) {
-                        RFRegressionTask rfTask = new RFRegressionTask(this.request, gisJoinBatch);
-                        batchedModelTasks.add(this.sparkManager.submit(rfTask, "rf-regression-query"));
-                    }
+                        Map<String,String> reverseChildToParentMap = new HashMap<>();
 
-                    // Wait for each task to complete and return their ModelResponses
-                    for (Future<List<ModelResponse>> indvTask: batchedModelTasks) {
-                        List<ModelResponse> batchedModelResponses = indvTask.get();
-                        for (ModelResponse modelResponse: batchedModelResponses) {
-                            this.responseObserver.onNext(modelResponse);
+                        // IGNORE GISJOIN SENT BY THE REQUEST. INSTEAD GET THE FIRST ENTRY
+                        java.util.Iterator<Map.Entry<String, List>> iterator = clusterCSVMap.entrySet().iterator();
+
+                        List<String> parents = new ArrayList<>();
+
+                        // A COMBINED LIST OF ALL DEPENDENT GISJOINS
+                        List<String> allchildrenGISList = new ArrayList<>();
+
+                        // MAP CONTAINING ALL PARENT MODELS
+                        Map<String, RandomForestRegressionModel> trained_parents_map = new HashMap<>();
+                        Map<String, Double> parentRMSEMap = new HashMap<>();
+
+                        while (iterator.hasNext()) {
+                            Map.Entry<String, List> firstEntry = iterator.next();
+                            String parentGisJoin = firstEntry.getKey();
+                            parents.add(parentGisJoin);
+                            List<String> childrenGisJoin = firstEntry.getValue();
+                            allchildrenGISList.addAll(childrenGisJoin);
+
+                            for(String child: childrenGisJoin) {
+                                reverseChildToParentMap.put(child, parentGisJoin);
+                            }
                         }
-                    }
 
-                } catch (Exception e) {
-                    log.error("Failed to evaluate query", e);
-                    responseObserver.onError(e);
+                        List<List<String>> gisJoinBatches_parent = batchGisJoins(parents, 20);
+
+                        // EXHAUSTIVELY TRAINING ALL THE PARENTS FIRST
+
+                        // ****************START PARENT TRAINING ***********************
+                        List<Future<List<ModelResponse>>> batchedModelTasks_parents = new ArrayList<>();
+                        for (List<String> gisJoinBatch: gisJoinBatches_parent) {
+                            RFRegressionTask gbTask = new RFRegressionTask(this.request, gisJoinBatch, parentRMSEMap, trained_parents_map);
+                            batchedModelTasks_parents.add(this.sparkManager.submit(gbTask, "gb-regression-query"));
+                        }
+
+                        // Wait for each task to complete and return their ModelResponses
+                        for (Future<List<ModelResponse>> indvTask: batchedModelTasks_parents) {
+                            List<ModelResponse> batchedModelResponses = indvTask.get();
+                            for (ModelResponse modelResponse: batchedModelResponses) {
+                                //DON'T THINK WE NEED RESPONSE OBSERVER HERE....NOTHING TO PASS BACK. JUST OBSERVE THE RESULTS
+                                full_log_string+=FancyLogger.fancy_logging("RECEIVED A RESPONSE FOR "+modelResponse.getRForestRegressionResponse().getGisJoin(),log);
+                                this.responseObserver.onNext(modelResponse);
+
+                            }
+                        }
+
+                        // JUST ITERATING AND PRINTING THE TRAINED MODELS
+                        java.util.Iterator<Map.Entry<String, RandomForestRegressionModel>> iterator_trained_models = trained_parents_map.entrySet().iterator();
+                        int cnt = 0;
+                        while (iterator_trained_models.hasNext()) {
+                            Map.Entry<String, RandomForestRegressionModel> firstEntry = iterator_trained_models.next();
+                            String parentGisJoin = firstEntry.getKey();
+                            parents.add(parentGisJoin);
+                            RandomForestRegressionModel trained_model = firstEntry.getValue();
+
+                            // LOG SOMETHING TO CHECK TRAINED MODEL IS HERE
+                            full_log_string+=FancyLogger.fancy_logging("Model Num "+(cnt+1)+"GISJOIN: "+
+                                    parentGisJoin+" Trained Model: "+trained_model.paramMap(), null);
+                            cnt++;
+                        }
+
+                        full_log_string+=FancyLogger.fancy_logging("PARENT TRAINING CONCLUDED!!!!!", null);
+                        System.out.println("PARENT TRAINING CONCLUDED!!!!!");
+                        // ****************END PARENT TRAINING ***********************
+                        full_log_string+=FancyLogger.fancy_logging("CHILDREN TRAINING STARTING,.....", null);
+                        System.out.println("CHILDREN TRAINING STARTING,.....");
+
+                        // ****************START CHILDREN TRAINING ***********************
+
+                        // BATCHING ALL THE CHILDREN INTO GROUPS OF 20
+                        List<List<String>> gisJoinBatches_children = batchGisJoins(allchildrenGISList, 20);
+
+                        List<Future<List<ModelResponse>>> batchedModelTasks_children = new ArrayList<>();
+                        for (List<String> gisJoinBatch: gisJoinBatches_children) {
+
+                            RFRegressionTask rfTask = new RFRegressionTask(this.request, gisJoinBatch, trained_parents_map, parentRMSEMap, reverseChildToParentMap);
+                            batchedModelTasks_children.add(this.sparkManager.submit(rfTask, "gb-regression-query"));
+                        }
+
+                        // Wait for each task to complete and return their ModelResponses
+                        for (Future<List<ModelResponse>> indvTask: batchedModelTasks_children) {
+                            List<ModelResponse> batchedModelResponses = indvTask.get();
+                            for (ModelResponse modelResponse: batchedModelResponses) {
+                                //DON'T THINK WE NEED RESPONSE OBSERVER HERE....NOTHING TO PASS BACK. JUST OBSERVE THE RESULTS
+                                full_log_string+=FancyLogger.fancy_logging("RECEIVED A RESPONSE FOR "+modelResponse.getRForestRegressionResponse().getGisJoin(),log);
+                                this.responseObserver.onNext(modelResponse);
+
+                            }
+                        }
+
+                        System.out.println(full_log_string);
+                        FancyLogger.write_out(full_log_string, filename);
+
+
+
+                    } catch (Exception e) {
+                        log.error("Failed to evaluate query", e);
+                        responseObserver.onError(e);
+                    }
                 }
             } else if(request.getType().equals(ModelType.G_BOOST_REGRESSION)) {
 
                 try {
                     GBoostRegressionRequest req = this.request.getGBoostRegressionRequest();
 
-                    List<List<String>> gisJoinBatches = batchGisJoins(req.getGisJoinsList(), 20);
+                    Map<String,String> reverseChildToParentMap = new HashMap<>();
 
-                    List<Future<List<ModelResponse>>> batchedModelTasks = new ArrayList<>();
-                    for (List<String> gisJoinBatch: gisJoinBatches) {
-                        GBRegressionTask gbTask = new GBRegressionTask(this.request, gisJoinBatch);
+                    // IGNORE GISJOIN SENT BY THE REQUEST. INSTEAD GET THE FIRST ENTRY
+                    java.util.Iterator<Map.Entry<String, List>> iterator = clusterCSVMap.entrySet().iterator();
+
+                    List<String> parents = new ArrayList<>();
+
+                    // A COMBINED LIST OF ALL DEPENDENT GISJOINS
+                    List<String> allchildrenGISList = new ArrayList<>();
+
+                    // MAP CONTAINING ALL PARENT MODELS
+                    Map<String, GBTRegressionModel> trained_parents_map = new HashMap<>();
+                    Map<String, Double> parentRMSEMap = new HashMap<>();
+
+                    while (iterator.hasNext()) {
+                        Map.Entry<String, List> firstEntry = iterator.next();
+                        String parentGisJoin = firstEntry.getKey();
+                        parents.add(parentGisJoin);
+                        List<String> childrenGisJoin = firstEntry.getValue();
+                        allchildrenGISList.addAll(childrenGisJoin);
+
+                        for(String child: childrenGisJoin) {
+                            reverseChildToParentMap.put(child, parentGisJoin);
+                        }
+                    }
+
+                    List<List<String>> gisJoinBatches_parent = batchGisJoins(parents, 20);
+
+                    //List<List<String>> gisJoinBatches_children = batchGisJoins(req.getGisJoinsList(), 20);
+
+                    // BATCH THE CHILDREN AS THEY ARE....EXECUTE THE CHILDREN ONE PARENT AT A TIME
+                    //List<List<String>> gisJoinBatches_children = childrenList;
+
+
+                    // EXHAUSTIVELY TRAINING ALL THE PARENTS FIRST
+
+                    // ****************START PARENT TRAINING ***********************
+                    List<Future<List<ModelResponse>>> batchedModelTasks_parents = new ArrayList<>();
+                    for (List<String> gisJoinBatch: gisJoinBatches_parent) {
+                        GBRegressionTask gbTask = new GBRegressionTask(this.request, gisJoinBatch, parentRMSEMap, trained_parents_map);
+                        batchedModelTasks_parents.add(this.sparkManager.submit(gbTask, "gb-regression-query"));
+                    }
+
+                    // Wait for each task to complete and return their ModelResponses
+                    for (Future<List<ModelResponse>> indvTask: batchedModelTasks_parents) {
+                        List<ModelResponse> batchedModelResponses = indvTask.get();
+                        for (ModelResponse modelResponse: batchedModelResponses) {
+                            //DON'T THINK WE NEED RESPONSE OBSERVER HERE....NOTHING TO PASS BACK. JUST OBSERVE THE RESULTS
+                            full_log_string+=FancyLogger.fancy_logging("RECEIVED A RESPONSE FOR "+modelResponse.getGBoostRegressionResponse().getGisJoin(),log);
+                            this.responseObserver.onNext(modelResponse);
+
+                        }
+                    }
+
+                    // JUST ITERATING AND PRINTING THE TRAINED MODELS
+                    java.util.Iterator<Map.Entry<String, GBTRegressionModel>> iterator_trained_models = trained_parents_map.entrySet().iterator();
+                    int cnt = 0;
+                    while (iterator_trained_models.hasNext()) {
+                        Map.Entry<String, GBTRegressionModel> firstEntry = iterator_trained_models.next();
+                        String parentGisJoin = firstEntry.getKey();
+                        parents.add(parentGisJoin);
+                        GBTRegressionModel trained_model = firstEntry.getValue();
+
+                        // LOG SOMETHING TO CHECK TRAINED MODEL IS HERE
+                        full_log_string+=FancyLogger.fancy_logging("Model Num "+(cnt+1)+"GISJOIN: "+
+                                parentGisJoin+" Trained Model: "+trained_model.paramMap(), null);
+                        cnt++;
+                    }
+
+                    full_log_string+=FancyLogger.fancy_logging("PARENT TRAINING CONCLUDED!!!!!", null);
+                    System.out.println("PARENT TRAINING CONCLUDED!!!!!");
+                    // ****************END PARENT TRAINING ***********************
+                    full_log_string+=FancyLogger.fancy_logging("CHILDREN TRAINING STARTING,.....", null);
+                    System.out.println("CHILDREN TRAINING STARTING,.....");
+
+                    // ****************START CHILDREN TRAINING ***********************
+
+                    // BATCHING ALL THE CHILDREN INTO GROUPS OF 20
+                    List<List<String>> gisJoinBatches_children = batchGisJoins(allchildrenGISList, 20);
+
+                    List<Future<List<ModelResponse>>> batchedModelTasks_children = new ArrayList<>();
+                    for (List<String> gisJoinBatch: gisJoinBatches_children) {
+
+                        GBRegressionTask gbTask = new GBRegressionTask(this.request, gisJoinBatch, trained_parents_map, parentRMSEMap, reverseChildToParentMap);
+                        batchedModelTasks_children.add(this.sparkManager.submit(gbTask, "gb-regression-query"));
+                    }
+
+                    // Wait for each task to complete and return their ModelResponses
+                    for (Future<List<ModelResponse>> indvTask: batchedModelTasks_children) {
+                        List<ModelResponse> batchedModelResponses = indvTask.get();
+                        for (ModelResponse modelResponse: batchedModelResponses) {
+                            //DON'T THINK WE NEED RESPONSE OBSERVER HERE....NOTHING TO PASS BACK. JUST OBSERVE THE RESULTS
+                            full_log_string+=FancyLogger.fancy_logging("RECEIVED A RESPONSE FOR "+modelResponse.getGBoostRegressionResponse().getGisJoin(),log);
+                            this.responseObserver.onNext(modelResponse);
+
+                        }
+                    }
+
+                    /*List<Future<List<ModelResponse>>> batchedModelTasks = new ArrayList<>();
+                    for (List<String> gisJoinBatch: gisJoinBatches_children) {
+                        GBRegressionTask gbTask = new GBRegressionTask(this.request, gisJoinBatch, trained_parents);
                         batchedModelTasks.add(this.sparkManager.submit(gbTask, "gb-regression-query"));
                     }
 
@@ -507,7 +736,12 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
                         for (ModelResponse modelResponse: batchedModelResponses) {
                             this.responseObserver.onNext(modelResponse);
                         }
-                    }
+                    }*/
+
+                    System.out.println(full_log_string);
+                    FancyLogger.write_out(full_log_string, filename);
+
+
 
                 } catch (Exception e) {
                     log.error("Failed to evaluate query", e);

@@ -29,38 +29,41 @@ import com.mongodb.spark.config.ReadConfig;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.spark.api.java.JavaSparkContext;
+import org.apache.spark.ml.evaluation.RegressionEvaluator;
 import org.apache.spark.ml.feature.VectorAssembler;
+import org.apache.spark.ml.param.ParamMap;
 import org.apache.spark.ml.regression.GBTRegressionModel;
 import org.apache.spark.ml.regression.GBTRegressor;
+import org.apache.spark.ml.tuning.CrossValidator;
+import org.apache.spark.ml.tuning.CrossValidatorModel;
+import org.apache.spark.ml.tuning.ParamGridBuilder;
 import org.apache.spark.mllib.evaluation.RegressionMetrics;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.storage.StorageLevel;
 import org.sustain.util.Constants;
+import org.sustain.util.FancyLogger;
 import scala.collection.JavaConverters;
 import scala.collection.Seq;
 
-import org.sustain.SparkManager;
-import org.sustain.SparkTask;
-
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.Future;
+
+// PERFORMS EXHAUSTIVE TRAINING OVER A SET OF PARAMETERS
 
 /**
  * Provides an interface for building generalized Gradient Boost Regression
  * models on data pulled in using Mongo's Spark Connector.
  */
-public class GBoostRegressionModel{
+public class GBoostChildIncrementalModel {
+
+    private String filename="";
 
     private Dataset<Row> mongoCollection;
     // DATABASE PARAMETERS
-    protected static final Logger log = LogManager.getLogger(GBoostRegressionModel.class);
+    protected static final Logger log = LogManager.getLogger(GBoostChildIncrementalModel.class);
     private String database, collection, mongoUri;
     private String[] features;
     private String label, gisJoin;
@@ -91,9 +94,18 @@ public class GBoostRegressionModel{
     private Integer maxBins = null;
     private Double trainSplit = 0.8d;
 
-    private GBTRegressor trained_gb;
+    private GBTRegressionModel parent_gbModel;
 
-    private GBTRegressionModel trained_gbModel;
+    public double getParent_rmse() {
+        return parent_rmse;
+    }
+
+    public void setParent_rmse(double parent_rmse) {
+        this.parent_rmse = parent_rmse;
+    }
+
+    public String parentGisJoin = "";
+    private double parent_rmse = 0.0;
 
     String queryField = "gis_join";
     //String queryField = "countyName";
@@ -101,12 +113,12 @@ public class GBoostRegressionModel{
     double rmse = 0.0;
     private double r2 = 0.0;
 
-    public GBTRegressor getTrained_gb() {
-        return trained_gb;
+    public void setParent_gbModel(GBTRegressionModel parent_gbModel) {
+        this.parent_gbModel = parent_gbModel;
     }
 
-    public GBTRegressionModel getTrained_gbModel() {
-        return trained_gbModel;
+    public GBTRegressionModel getParent_gbModel() {
+        return parent_gbModel;
     }
 
     public Dataset<Row> getMongoCollection() {
@@ -177,12 +189,17 @@ public class GBoostRegressionModel{
         this.trainSplit = trainSplit;
     }
 
-    public GBoostRegressionModel(String mongoUri, String database, String collection, String gisJoin) {
+    public GBoostChildIncrementalModel(String mongoUri, String database, String collection, String gisJoin) {
         log.info("Gradient Boosting constructor invoked");
         setMongoUri(mongoUri);
         setDatabase(database);
         setCollection(collection);
         setGisjoin(gisJoin);
+        filename = "children/"+parentGisJoin+"_"+gisJoin+".txt";
+    }
+
+    public void setFilename() {
+        this.filename = "children/"+parentGisJoin+"_"+gisJoin+".txt";
     }
 
     public String getDatabase() {
@@ -298,13 +315,14 @@ public class GBoostRegressionModel{
         return JavaConverters.asScalaIteratorConverter(inputList.iterator()).asScala().toSeq();
     }
 
-    private void fancy_logging(String msg){
+    private String fancy_logging(String msg){
 
         String logStr = "\n============================================================================================================\n";
         logStr+=msg;
         logStr+="\n============================================================================================================";
 
         log.info(logStr);
+        return logStr;
     }
 
     private double calc_interval(double startTime) {
@@ -318,56 +336,95 @@ public class GBoostRegressionModel{
         //addClusterDependencyJars(sparkContext);
         double startTime = System.currentTimeMillis();
 
-        fancy_logging("Initiating Gradient Boost Modelling...");
+        String msg = "";
+        msg = "Initiating Gradient Boost Modelling...";
+
+        FancyLogger.write_out(fancy_logging(msg), filename);
 
         // Select just the columns we want, discard the rest
         Dataset<Row> selected = mongoCollection.select("_id", desiredColumns());
 
-        fancy_logging("Data Fetch Completed in "+ calc_interval(startTime)+" secs");
+        msg = "Data Fetch Completed in "+ calc_interval(startTime)+" secs";
+
+        FancyLogger.write_out(fancy_logging(msg), filename);
         startTime = System.currentTimeMillis();
-
-        Dataset<Row> gisDataset = selected.filter(selected.col(queryField).equalTo(gisJoin))
-                .withColumnRenamed(this.label, "label"); // Rename the chosen label column to "label"
-
-        log.info("DATA TYPES: \n"+Arrays.toString(gisDataset.columns())+" "+gisDataset.dtypes());
 
         // Create a VectorAssembler to assemble all the feature columns into a single column vector named "features"
         VectorAssembler vectorAssembler = new VectorAssembler()
                 .setInputCols(this.features)
                 .setOutputCol("features");
 
-        // Transform the gisDataset to have the new "features" column vector
-        Dataset<Row> mergedDataset = vectorAssembler.transform(gisDataset);
+        msg = "Data Manipulation completed in "+calc_interval(startTime)+" secs"/*+"\nData Size: "+gisDataset.count()*/;
+
+        FancyLogger.write_out(fancy_logging(msg), filename);
+
+        /* ITERATIVE SAMPLING OF THE mergedDataset*/
+        float trainFraction = 0.15f;
+        // PREPARING DATASET2
+        Dataset<Row> gisDataset2 = selected.filter(selected.col(queryField).equalTo(gisJoin))
+                .withColumnRenamed(this.label, "label"); // Rename the chosen label column to "label"
+
+        //gisDataset2 = gisDataset2.sample(0.1);
+
+        Dataset<Row> mergedDataset_transfer = vectorAssembler.transform(gisDataset2).cache();
+
+        // COPYING PARAMETERS FROM PRE_TRAINED MODEL
+        GBTRegressionModel gb2_model = parent_gbModel.copy(new ParamMap());
+        GBTRegressor gb2 = (GBTRegressor) gb2_model.parent();
+
+        int iter = 0;
+        double targetRMSE = getParent_rmse();
+        String fullSummary = "";
+
+        long startTime_overall = System.currentTimeMillis();
+        while (true) {
+            startTime = System.currentTimeMillis();
+            Dataset<Row> workingDataset = mergedDataset_transfer.sample(trainFraction);
+            Dataset<Row>[] rds_transfer = workingDataset.randomSplit(new double[]{trainSplit, 1.0d - trainSplit});
+            Dataset<Row> trainrdd_transfer = rds_transfer[0].cache();
+            Dataset<Row> testrdd_transfer = rds_transfer[1];
+            fancy_logging("Model Data Split completed in " + calc_interval(startTime));
+
+            /* TRAIN PHASE */
+
+            GBTRegressionModel gb2Model_iter = gb2.fit(trainrdd_transfer);
+            fullSummary += FancyLogger.fancy_logging("Model Training Round " + iter + " completed in " + calc_interval(startTime)) +"\n";
+
+            /* TEST/EVALUATION PHASE */
+            startTime = System.currentTimeMillis();
+            Dataset<Row> pred_pair = gb2Model_iter.transform(testrdd_transfer).select("label", "prediction").cache();
+            RegressionMetrics metrics = new RegressionMetrics(pred_pair);
+            this.rmse = metrics.rootMeanSquaredError();
+
+            fullSummary += FancyLogger.fancy_logging("Model Evaluation/Loss Computation Round " + iter + " completed in " + calc_interval(startTime)
+                    + "\nEVALUATIONS: RMSE, R2: " + rmse + " " + r2) + "\n";
+
+            logModelResults();
+
+            trainFraction = trainFraction * 2;
+
+            if (this.rmse < targetRMSE) {
+                fullSummary += FancyLogger.fancy_logging("DESIRED ACCURACY ACHIEVED... EVALUATION TIME"+targetRMSE+" "+this.rmse) + "\n";
+                break;
+            } else if (trainFraction > 0.9) {
+                fullSummary += FancyLogger.fancy_logging("DESIRED ACCURACY NOT ACHIEVED... RAN OUT OF SAMPLES") + "\n";
+            } else {
+                fullSummary += FancyLogger.fancy_logging("DESIRED ACCURACY NOT ACHIEVED " + targetRMSE+" "+this.rmse + " ...RETRAINING") + "\n";
+
+            }
+
+            // COPYING OVER PARAMETERS FROM PREVIOUS ITERATION
+            GBTRegressor gb2_tmp = new GBTRegressor().setFeaturesCol("features").setLabelCol("label");
+            gb2_tmp.copy(gb2Model_iter.paramMap());
+            gb2 = gb2_tmp;
+            iter++;
+        }
+
+        fullSummary+= FancyLogger.fancy_logging("OVERALL CONVERGENCE TIME " + calc_interval(startTime_overall)
+                + "\nEVALUATIONS: RMSE, R2: " + rmse + " " + r2) + "\n";
+        FancyLogger.write_out(fullSummary,filename);
 
 
-        Dataset<Row>[] rds = mergedDataset.randomSplit(new double[]{trainSplit , 1.0d - trainSplit});
-        Dataset<Row> trainrdd = rds[0].persist(StorageLevel.MEMORY_ONLY());
-        Dataset<Row> testrdd = rds[1];
-
-        fancy_logging("Data Manipulation completed in "+calc_interval(startTime)+" secs"/*+"\nData Size: "+gisDataset.count()*/);
-        startTime = System.currentTimeMillis();
-
-        GBTRegressor gb = new GBTRegressor().setFeaturesCol("features").setLabelCol("label");
-
-        // POPULATING USER PARAMETERS
-        ingestParameters(gb);
-
-        GBTRegressionModel gbModel = gb.fit(trainrdd);
-
-        fancy_logging("Model Training completed in "+calc_interval(startTime));
-        startTime = System.currentTimeMillis();
-
-        Dataset<Row> pred_pair = gbModel.transform(testrdd).select("label", "prediction").cache();
-
-        RegressionMetrics metrics = new RegressionMetrics(pred_pair);
-
-        this.rmse = metrics.rootMeanSquaredError();
-        this.r2 = metrics.r2();
-        fancy_logging("Model Testing/Loss Computation completed in "+calc_interval(startTime)+"\nEVALUATIONS: RMSE, R2: "+rmse+" "+r2);
-
-        logModelResults();
-        this.trained_gb = gb;
-        this.trained_gbModel = gbModel;
         return true;
     }
 
@@ -466,7 +523,7 @@ public class GBoostRegressionModel{
         JavaSparkContext sparkContext = new JavaSparkContext(sparkSession.sparkContext());
         ReadConfig readConfig = ReadConfig.create(sparkContext);
 
-        GBoostRegressionModel gbModel = new GBoostRegressionModel(
+        GBoostChildIncrementalModel gbModel = new GBoostChildIncrementalModel(
                 "mongodb://lattice-46:27017", "sustaindb", collection_name, gisJoins);
         gbModel.setMongoCollection(MongoSpark.load(sparkContext, readConfig).toDF());
         gbModel.populateTest();

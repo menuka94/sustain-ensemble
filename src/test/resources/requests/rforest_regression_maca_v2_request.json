@@ -2,10 +2,10 @@
   "type": "R_FOREST_REGRESSION",
   "collections": [
     {
-      "name": "macav2",
-      "label": "min_eastward_wind",
+      "name": "noaa_nam",
+      "label": "temp_surface_level_kelvin",
       "features": [
-        "max_eastward_wind","max_min_air_temperature"
+        "relative_humidity_percent","orography_surface_level_meters","10_metre_u_wind_component_meters_per_second","10_metre_v_wind_component_meters_per_second","pressure_pascal","visibility_meters","total_cloud_cover_percent"
       ]
     }
   ],
