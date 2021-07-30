@@ -511,7 +511,7 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
         if (isValid(this.request)) {
 
             // PARSE THE CLUSTER CSV
-            Map<String, List> clusterCSVMap = CountyClusters.extractCountyGroups("./src/main/java/org/sustain/handlers/clusters_mid.csv");
+            Map<String, List> clusterCSVMap = CountyClusters.extractCountyGroups("./src/main/java/org/sustain/handlers/clusters_test.csv");
             full_log_string+=FancyLogger.fancy_logging("CLUSTER_MAP: "+clusterCSVMap, null);
             if (request.getType().equals(ModelType.R_FOREST_REGRESSION)) {
                 {

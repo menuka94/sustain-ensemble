@@ -9,7 +9,7 @@ import java.io.IOException;
 
 public class FancyLogger {
 
-    public static String base_path = "/s/chopin/e/proj/sustain/sapmitra/spark_mongo/logs/";
+    public static String base_path = "/s/parsons/b/others/sustain/sustain-transfer-learning/";
 
     public static String fancy_logging(String msg, Logger log){
 
