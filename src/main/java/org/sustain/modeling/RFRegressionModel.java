@@ -437,7 +437,7 @@ public class RFRegressionModel{
 
     }
 
-    private void addClusterDependencyJars(JavaSparkContext sparkContext) {
+    private static void addClusterDependencyJars(JavaSparkContext sparkContext) {
         String[] jarPaths = {
                 "build/libs/mongo-spark-connector_2.12-3.0.1.jar",
                 "build/libs/spark-core_2.12-3.0.1.jar",
@@ -481,14 +481,16 @@ public class RFRegressionModel{
                 .appName("SUSTAIN RForest Regression Model")
                 .config("spark.mongodb.input.uri", String.format("mongodb://%s:%d", Constants.DB.HOST, Constants.DB.PORT))
                 .config("spark.mongodb.input.database", Constants.DB.NAME)
-                .config("spark.mongodb.input.collection", "maca_v2")
+                .config("spark.mongodb.input.collection", "macav2")
                 .getOrCreate();
 
         JavaSparkContext sparkContext = new JavaSparkContext(sparkSession.sparkContext());
+        addClusterDependencyJars(sparkContext);
+
         ReadConfig readConfig = ReadConfig.create(sparkContext);
 
         RFRegressionModel rfModel = new RFRegressionModel(
-                "mongodb://lattice-46:27017", "sustaindb", collection_name, gisJoins);
+            String.format("mongodb://%s:%d", Constants.DB.HOST, Constants.DB.PORT), "sustaindb", collection_name, gisJoins);
         rfModel.setMongoCollection(MongoSpark.load(sparkContext, readConfig).toDF());
         rfModel.populateTest();
         rfModel.setFeatures(features);
