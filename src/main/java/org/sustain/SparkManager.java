@@ -16,7 +16,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 
 public class SparkManager {
-    protected ExecutorService executorService; 
+    protected ExecutorService executorService;
     protected List<String> jars;
     private String sparkMaster;
 
@@ -33,7 +33,7 @@ public class SparkManager {
     protected void cancel(String jobGroup) throws Exception {
         // initialize spark session
         SparkSession sparkSession = getOrCreateSparkSession();
-        JavaSparkContext sparkContext = 
+        JavaSparkContext sparkContext =
             new JavaSparkContext(sparkSession.sparkContext());
 
         // cancel job group
@@ -42,27 +42,53 @@ public class SparkManager {
 
     protected SparkSession getOrCreateSparkSession() throws Exception {
         // get or create SparkSession
-        SparkSession sparkSession = SparkSession.builder()
-            .master(this.sparkMaster)
-            .appName("sustain-query-service-" + Constants.Server.HOST)
-            .config("spark.executor.cores",
-                Constants.Spark.EXECUTOR_CORES)
-            .config("spark.executor.memory",
-                Constants.Spark.EXECUTOR_MEMORY)
-            .config("spark.dynamicAllocation.enabled", "true")
-            .config("spark.dynamicAllocation.shuffleTracking.enabled", "true")
-            .config("spark.dynamicAllocation.initialExecutors",
-                Constants.Spark.INITIAL_EXECUTORS)
-            .config("spark.dynamicAllocation.minExecutors",
-                Constants.Spark.MIN_EXECUTORS)
-            .config("spark.dynamicAllocation.maxExecutors",
-                Constants.Spark.MAX_EXECUTORS)
-            .config("spark.dynamicAllocation.schedulerBacklogTimeout",
-                Constants.Spark.BACKLOG_TIMEOUT)
-            .config("spark.dynamicAllocation.executorIdleTimeout",
-                Constants.Spark.IDLE_TIMEOUT)
-            .config("mongodb.keep_alive_ms", "100000")
-            .getOrCreate();
+        SparkSession sparkSession;
+        if (Constants.K8s.USE_KUBERNETES) {
+            sparkSession = SparkSession.builder()
+                .master(Constants.K8s.SPARK_K8S_MASTER)
+                .appName("sustain-query-service-" + Constants.Server.HOST)
+                .config("spark.kubernetes.container.image", Constants.K8s.SPARK_DOCKER_IMAGE)
+                .config("spark.executor.cores",
+                    Constants.Spark.EXECUTOR_CORES)
+                .config("spark.executor.memory",
+                    Constants.Spark.EXECUTOR_MEMORY)
+                .config("spark.dynamicAllocation.enabled", "true")
+                .config("spark.dynamicAllocation.shuffleTracking.enabled", "true")
+                .config("spark.dynamicAllocation.initialExecutors",
+                    Constants.Spark.INITIAL_EXECUTORS)
+                .config("spark.dynamicAllocation.minExecutors",
+                    Constants.Spark.MIN_EXECUTORS)
+                .config("spark.dynamicAllocation.maxExecutors",
+                    Constants.Spark.MAX_EXECUTORS)
+                .config("spark.dynamicAllocation.schedulerBacklogTimeout",
+                    Constants.Spark.BACKLOG_TIMEOUT)
+                .config("spark.dynamicAllocation.executorIdleTimeout",
+                    Constants.Spark.IDLE_TIMEOUT)
+                .config("mongodb.keep_alive_ms", "100000")
+                .getOrCreate();
+        } else {
+            sparkSession = SparkSession.builder()
+                .master(Constants.Spark.MASTER)
+                .appName("sustain-query-service-" + Constants.Server.HOST)
+                .config("spark.executor.cores",
+                    Constants.Spark.EXECUTOR_CORES)
+                .config("spark.executor.memory",
+                    Constants.Spark.EXECUTOR_MEMORY)
+                .config("spark.dynamicAllocation.enabled", "true")
+                .config("spark.dynamicAllocation.shuffleTracking.enabled", "true")
+                .config("spark.dynamicAllocation.initialExecutors",
+                    Constants.Spark.INITIAL_EXECUTORS)
+                .config("spark.dynamicAllocation.minExecutors",
+                    Constants.Spark.MIN_EXECUTORS)
+                .config("spark.dynamicAllocation.maxExecutors",
+                    Constants.Spark.MAX_EXECUTORS)
+                .config("spark.dynamicAllocation.schedulerBacklogTimeout",
+                    Constants.Spark.BACKLOG_TIMEOUT)
+                .config("spark.dynamicAllocation.executorIdleTimeout",
+                    Constants.Spark.IDLE_TIMEOUT)
+                .config("mongodb.keep_alive_ms", "100000")
+                .getOrCreate();
+        }
 
         // if they don't exist - add JARs to SparkContext
         JavaSparkContext sparkContext =
@@ -77,11 +103,11 @@ public class SparkManager {
     }
 
     public <T> Future<T> submit(SparkTask<T> sparkTask,
-            String jobGroup) throws Exception {
+                                String jobGroup) throws Exception {
         Future<T> future = this.executorService.submit(() -> {
             // initialize spark session
             SparkSession sparkSession = getOrCreateSparkSession();
-            JavaSparkContext sparkContext = 
+            JavaSparkContext sparkContext =
                 new JavaSparkContext(sparkSession.sparkContext());
 
             // set job group so all jobs submitted from this thread
