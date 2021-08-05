@@ -2,8 +2,6 @@ package org.sustain;
 
 import org.apache.log4j.LogManager;
 import org.apache.log4j.Logger;
-import org.apache.spark.SparkConf;
-import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.sql.SparkSession;
 
@@ -12,7 +10,6 @@ import org.sustain.util.Constants;
 import java.util.ArrayList;
 import java.util.List;
 
-import java.util.concurrent.Callable;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
@@ -21,10 +18,10 @@ public class SparkManager {
     private static final Logger log = LogManager.getLogger(SparkManager.class);
     protected ExecutorService executorService;
     protected List<String> jars;
-    private String sparkMaster;
+//    private String sparkMaster;
 
-    public SparkManager(String sparkMaster) {
-        this.sparkMaster = sparkMaster;
+    public SparkManager() {
+//        this.sparkMaster = sparkMaster;
         this.jars = new ArrayList();
         this.executorService = Executors.newCachedThreadPool();
     }
@@ -49,11 +46,9 @@ public class SparkManager {
         if (Constants.K8s.USE_KUBERNETES) {
             log.info("Running Spark on Kubernetes");
             sparkSession = SparkSession.builder()
-                .master(Constants.K8s.SPARK_K8S_MASTER)
+                .master(Constants.K8s.KUBERNETES_SPARK_MASTER)
                 .appName("sustain-query-service-" + Constants.Server.HOST)
                 .config("spark.kubernetes.container.image", Constants.K8s.SPARK_DOCKER_IMAGE)
-                .config("spark.mongodb.input.uri",
-                    String.format("mongodb://%s:%d/sustaindb.macav2", Constants.DB.HOST, Constants.DB.PORT))
                 .config("spark.executor.cores",
                     Constants.Spark.EXECUTOR_CORES)
                 .config("spark.executor.memory",
@@ -77,8 +72,6 @@ public class SparkManager {
             sparkSession = SparkSession.builder()
                 .master(Constants.Spark.MASTER)
                 .appName("sustain-query-service-" + Constants.Server.HOST)
-                .config("spark.mongodb.input.uri",
-                    String.format("mongodb://%s:%d/sustaindb.macav2", Constants.DB.HOST, Constants.DB.PORT))
                 .config("spark.executor.cores",
                     Constants.Spark.EXECUTOR_CORES)
                 .config("spark.executor.memory",

@@ -4,7 +4,7 @@ public class Constants {
     public static final String GIS_JOIN = "GISJOIN";
 
     public static class K8s {
-        public static final String SPARK_K8S_MASTER = System.getenv("SPARK_K8S_MASTER");
+        public static final String KUBERNETES_SPARK_MASTER = System.getenv("KUBERNETES_SPARK_MASTER");
         public static final boolean USE_KUBERNETES = Boolean.parseBoolean(System.getenv("USE_KUBERNETES"));
         public static final String SPARK_DOCKER_IMAGE = System.getenv("SPARK_DOCKER_IMAGE");
     }
