@@ -40,6 +40,10 @@ dependencies {
     implementation 'org.apache.spark:spark-mllib_2.12:3.0.1'
     implementation 'org.mongodb.spark:mongo-spark-connector_2.12:3.0.1'
 
+    // https://mvnrepository.com/artifact/org.apache.spark/spark-kubernetes
+    implementation group: 'org.apache.spark', name: 'spark-kubernetes_2.12', version: '3.0.1'
+
+
     compileOnly "org.apache.tomcat:annotations-api:6.0.53"
     runtimeOnly "io.netty:netty-tcnative-boringssl-static:${nettyTcNativeVersion}"
 
