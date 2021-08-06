@@ -44,11 +44,14 @@ import org.sustain.util.FancyLogger;
 import scala.Tuple2;
 import scala.collection.Iterator;
 
+import java.io.File;
+import java.nio.file.Files;
 import java.util.*;
 import java.util.concurrent.Future;
 
 public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelResponse> {
 
+    private String model_save_path = "/s/chopin/e/proj/sustain/sapmitra/spark_mongo/saved_models/";
     private static final double targetVariance = 0.95;
     private static final double samplingPercentage = 0.0003;
     private static final Logger log = LogManager.getLogger(EnsembleQueryHandler.class);
@@ -504,11 +507,36 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
         return batches;
     }
 
+
+    private boolean find_mode(ModelRequest request) {
+        int val = 7;
+        if (request.getType().equals(ModelType.R_FOREST_REGRESSION)){
+            RForestRegressionRequest req = request.getRForestRegressionRequest();
+            val = req.getMaxDepth();
+
+        } else if (request.getType().equals(ModelType.G_BOOST_REGRESSION)) {
+            GBoostRegressionRequest req = request.getGBoostRegressionRequest();
+            val = req.getMaxDepth();
+
+        }
+
+        if (val >=0) {
+            System.out.println("EXHAUSTIVE MODE !!!!!!!!!!!!!!!!!!!!!!!!!!!");
+            return true;
+        } else {
+            System.out.println("TL MODE !!!!!!!!!!!!!!!!!!!!!!!!!!!");
+            return false;
+        }
+
+    }
+
     @Override
     public void handleRequest() {
 
         String full_log_string = "";
         if (isValid(this.request)) {
+
+            boolean isExhaustive = find_mode(this.request);
 
             // PARSE THE CLUSTER CSV
             Map<String, List> clusterCSVMap = CountyClusters.extractCountyGroups("./src/main/java/org/sustain/handlers/clusters_test.csv");
@@ -547,74 +575,90 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
 
                         List<List<String>> gisJoinBatches_parent = batchGisJoins(parents, 20);
 
-                        // EXHAUSTIVELY TRAINING ALL THE PARENTS FIRST
+                        if(isExhaustive) {
+                            // EXHAUSTIVELY TRAINING ALL THE PARENTS FIRST
 
-                        // ****************START PARENT TRAINING ***********************
-                        List<Future<List<ModelResponse>>> batchedModelTasks_parents = new ArrayList<>();
-                        for (List<String> gisJoinBatch: gisJoinBatches_parent) {
-                            RFRegressionTask gbTask = new RFRegressionTask(this.request, gisJoinBatch, parentRMSEMap, trained_parents_map);
-                            batchedModelTasks_parents.add(this.sparkManager.submit(gbTask, "gb-regression-query"));
-                        }
-
-                        // Wait for each task to complete and return their ModelResponses
-                        for (Future<List<ModelResponse>> indvTask: batchedModelTasks_parents) {
-                            List<ModelResponse> batchedModelResponses = indvTask.get();
-                            for (ModelResponse modelResponse: batchedModelResponses) {
-                                //DON'T THINK WE NEED RESPONSE OBSERVER HERE....NOTHING TO PASS BACK. JUST OBSERVE THE RESULTS
-                                full_log_string+=FancyLogger.fancy_logging("RECEIVED A RESPONSE FOR "+modelResponse.getRForestRegressionResponse().getGisJoin(),log);
-                                this.responseObserver.onNext(modelResponse);
-
+                            // ****************START PARENT TRAINING ***********************
+                            List<Future<List<ModelResponse>>> batchedModelTasks_parents = new ArrayList<>();
+                            for (List<String> gisJoinBatch : gisJoinBatches_parent) {
+                                RFRegressionTask gbTask = new RFRegressionTask(this.request, gisJoinBatch, parentRMSEMap, trained_parents_map);
+                                batchedModelTasks_parents.add(this.sparkManager.submit(gbTask, "gb-regression-query"));
                             }
-                        }
 
-                        // JUST ITERATING AND PRINTING THE TRAINED MODELS
-                        java.util.Iterator<Map.Entry<String, RandomForestRegressionModel>> iterator_trained_models = trained_parents_map.entrySet().iterator();
-                        int cnt = 0;
-                        while (iterator_trained_models.hasNext()) {
-                            Map.Entry<String, RandomForestRegressionModel> firstEntry = iterator_trained_models.next();
-                            String parentGisJoin = firstEntry.getKey();
-                            parents.add(parentGisJoin);
-                            RandomForestRegressionModel trained_model = firstEntry.getValue();
+                            // Wait for each task to complete and return their ModelResponses
+                            for (Future<List<ModelResponse>> indvTask : batchedModelTasks_parents) {
+                                List<ModelResponse> batchedModelResponses = indvTask.get();
+                                for (ModelResponse modelResponse : batchedModelResponses) {
+                                    //DON'T THINK WE NEED RESPONSE OBSERVER HERE....NOTHING TO PASS BACK. JUST OBSERVE THE RESULTS
+                                    full_log_string += FancyLogger.fancy_logging("RECEIVED A RESPONSE FOR " + modelResponse.getRForestRegressionResponse().getGisJoin(), log);
+                                    this.responseObserver.onNext(modelResponse);
 
-                            // LOG SOMETHING TO CHECK TRAINED MODEL IS HERE
-                            full_log_string+=FancyLogger.fancy_logging("Model Num "+(cnt+1)+"GISJOIN: "+
-                                    parentGisJoin+" Trained Model: "+trained_model.paramMap(), null);
-                            cnt++;
-                        }
-
-                        full_log_string+=FancyLogger.fancy_logging("PARENT TRAINING CONCLUDED!!!!!", null);
-                        System.out.println("PARENT TRAINING CONCLUDED!!!!!");
-                        // ****************END PARENT TRAINING ***********************
-                        full_log_string+=FancyLogger.fancy_logging("CHILDREN TRAINING STARTING,.....", null);
-                        System.out.println("CHILDREN TRAINING STARTING,.....");
-
-                        // ****************START CHILDREN TRAINING ***********************
-
-                        // BATCHING ALL THE CHILDREN INTO GROUPS OF 20
-                        List<List<String>> gisJoinBatches_children = batchGisJoins(allchildrenGISList, 20);
-
-                        List<Future<List<ModelResponse>>> batchedModelTasks_children = new ArrayList<>();
-                        for (List<String> gisJoinBatch: gisJoinBatches_children) {
-
-                            RFRegressionTask rfTask = new RFRegressionTask(this.request, gisJoinBatch, trained_parents_map, parentRMSEMap, reverseChildToParentMap);
-                            batchedModelTasks_children.add(this.sparkManager.submit(rfTask, "gb-regression-query"));
-                        }
-
-                        // Wait for each task to complete and return their ModelResponses
-                        for (Future<List<ModelResponse>> indvTask: batchedModelTasks_children) {
-                            List<ModelResponse> batchedModelResponses = indvTask.get();
-                            for (ModelResponse modelResponse: batchedModelResponses) {
-                                //DON'T THINK WE NEED RESPONSE OBSERVER HERE....NOTHING TO PASS BACK. JUST OBSERVE THE RESULTS
-                                full_log_string+=FancyLogger.fancy_logging("RECEIVED A RESPONSE FOR "+modelResponse.getRForestRegressionResponse().getGisJoin(),log);
-                                this.responseObserver.onNext(modelResponse);
-
+                                }
                             }
+
+                            // JUST ITERATING AND PRINTING THE TRAINED MODELS
+                            java.util.Iterator<Map.Entry<String, RandomForestRegressionModel>> iterator_trained_models = trained_parents_map.entrySet().iterator();
+                            int cnt = 0;
+                            while (iterator_trained_models.hasNext()) {
+                                Map.Entry<String, RandomForestRegressionModel> firstEntry = iterator_trained_models.next();
+                                String parentGisJoin = firstEntry.getKey();
+                                //parents.add(parentGisJoin);
+                                RandomForestRegressionModel trained_model = firstEntry.getValue();
+
+                                trained_model.save(model_save_path+parentGisJoin+".model");
+                                // LOG SOMETHING TO CHECK TRAINED MODEL IS HERE
+                                full_log_string += FancyLogger.fancy_logging("Model Num " + (cnt + 1) + "GISJOIN: " +
+                                        parentGisJoin + " Trained Model: " + trained_model.paramMap(), null);
+                                cnt++;
+                            }
+
+                            full_log_string += FancyLogger.fancy_logging("PARENT TRAINING CONCLUDED!!!!!", null);
+                            System.out.println("PARENT TRAINING CONCLUDED!!!!!");
+                            System.out.println(full_log_string);
+                            FancyLogger.write_out(full_log_string, filename);
+
+                        } else {
+                            // ****************END PARENT TRAINING ***********************
+                            full_log_string += FancyLogger.fancy_logging("CHILDREN TRAINING STARTING,.....", null);
+                            System.out.println("CHILDREN TRAINING STARTING,.....");
+                            for(String parent: parents) {
+                                File tempFile = new File(model_save_path+parent+".model");
+                                boolean isSaved = tempFile.exists();
+                                if (isSaved) {
+                                    RandomForestRegressionModel model = RandomForestRegressionModel.load(model_save_path + parent + ".model");
+                                    trained_parents_map.put(parent, model);
+                                } else{
+                                    System.out.println("SAVED MODEL NOT FOUND FOR:"+ parent);
+                                }
+                            }
+
+                            // ****************START CHILDREN TRAINING ***********************
+
+                            // BATCHING ALL THE CHILDREN INTO GROUPS OF 20
+                            List<List<String>> gisJoinBatches_children = batchGisJoins(allchildrenGISList, 20);
+
+                            List<Future<List<ModelResponse>>> batchedModelTasks_children = new ArrayList<>();
+                            for (List<String> gisJoinBatch : gisJoinBatches_children) {
+
+                                RFRegressionTask rfTask = new RFRegressionTask(this.request, gisJoinBatch, trained_parents_map, parentRMSEMap, reverseChildToParentMap);
+                                batchedModelTasks_children.add(this.sparkManager.submit(rfTask, "gb-regression-query"));
+                            }
+
+                            // Wait for each task to complete and return their ModelResponses
+                            for (Future<List<ModelResponse>> indvTask : batchedModelTasks_children) {
+                                List<ModelResponse> batchedModelResponses = indvTask.get();
+                                for (ModelResponse modelResponse : batchedModelResponses) {
+                                    //DON'T THINK WE NEED RESPONSE OBSERVER HERE....NOTHING TO PASS BACK. JUST OBSERVE THE RESULTS
+                                    full_log_string += FancyLogger.fancy_logging("RECEIVED A RESPONSE FOR " + modelResponse.getRForestRegressionResponse().getGisJoin(), log);
+                                    this.responseObserver.onNext(modelResponse);
+
+                                }
+                            }
+
+                            System.out.println(full_log_string);
+                            FancyLogger.write_out(full_log_string, filename);
+
                         }
-
-                        System.out.println(full_log_string);
-                        FancyLogger.write_out(full_log_string, filename);
-
-
 
                     } catch (Exception e) {
                         log.error("Failed to evaluate query", e);
@@ -654,94 +698,90 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
 
                     List<List<String>> gisJoinBatches_parent = batchGisJoins(parents, 20);
 
-                    //List<List<String>> gisJoinBatches_children = batchGisJoins(req.getGisJoinsList(), 20);
+                    if(isExhaustive) {
+                        // EXHAUSTIVELY TRAINING ALL THE PARENTS FIRST
 
-                    // BATCH THE CHILDREN AS THEY ARE....EXECUTE THE CHILDREN ONE PARENT AT A TIME
-                    //List<List<String>> gisJoinBatches_children = childrenList;
-
-
-                    // EXHAUSTIVELY TRAINING ALL THE PARENTS FIRST
-
-                    // ****************START PARENT TRAINING ***********************
-                    List<Future<List<ModelResponse>>> batchedModelTasks_parents = new ArrayList<>();
-                    for (List<String> gisJoinBatch: gisJoinBatches_parent) {
-                        GBRegressionTask gbTask = new GBRegressionTask(this.request, gisJoinBatch, parentRMSEMap, trained_parents_map);
-                        batchedModelTasks_parents.add(this.sparkManager.submit(gbTask, "gb-regression-query"));
-                    }
-
-                    // Wait for each task to complete and return their ModelResponses
-                    for (Future<List<ModelResponse>> indvTask: batchedModelTasks_parents) {
-                        List<ModelResponse> batchedModelResponses = indvTask.get();
-                        for (ModelResponse modelResponse: batchedModelResponses) {
-                            //DON'T THINK WE NEED RESPONSE OBSERVER HERE....NOTHING TO PASS BACK. JUST OBSERVE THE RESULTS
-                            full_log_string+=FancyLogger.fancy_logging("RECEIVED A RESPONSE FOR "+modelResponse.getGBoostRegressionResponse().getGisJoin(),log);
-                            this.responseObserver.onNext(modelResponse);
-
+                        // ****************START PARENT TRAINING ***********************
+                        List<Future<List<ModelResponse>>> batchedModelTasks_parents = new ArrayList<>();
+                        for (List<String> gisJoinBatch : gisJoinBatches_parent) {
+                            GBRegressionTask gbTask = new GBRegressionTask(this.request, gisJoinBatch, parentRMSEMap, trained_parents_map);
+                            batchedModelTasks_parents.add(this.sparkManager.submit(gbTask, "gb-regression-query"));
                         }
-                    }
 
-                    // JUST ITERATING AND PRINTING THE TRAINED MODELS
-                    java.util.Iterator<Map.Entry<String, GBTRegressionModel>> iterator_trained_models = trained_parents_map.entrySet().iterator();
-                    int cnt = 0;
-                    while (iterator_trained_models.hasNext()) {
-                        Map.Entry<String, GBTRegressionModel> firstEntry = iterator_trained_models.next();
-                        String parentGisJoin = firstEntry.getKey();
-                        parents.add(parentGisJoin);
-                        GBTRegressionModel trained_model = firstEntry.getValue();
+                        // Wait for each task to complete and return their ModelResponses
+                        for (Future<List<ModelResponse>> indvTask : batchedModelTasks_parents) {
+                            List<ModelResponse> batchedModelResponses = indvTask.get();
+                            for (ModelResponse modelResponse : batchedModelResponses) {
+                                //DON'T THINK WE NEED RESPONSE OBSERVER HERE....NOTHING TO PASS BACK. JUST OBSERVE THE RESULTS
+                                full_log_string += FancyLogger.fancy_logging("RECEIVED A RESPONSE FOR " + modelResponse.getGBoostRegressionResponse().getGisJoin(), log);
+                                this.responseObserver.onNext(modelResponse);
 
-                        // LOG SOMETHING TO CHECK TRAINED MODEL IS HERE
-                        full_log_string+=FancyLogger.fancy_logging("Model Num "+(cnt+1)+"GISJOIN: "+
-                                parentGisJoin+" Trained Model: "+trained_model.paramMap(), null);
-                        cnt++;
-                    }
-
-                    full_log_string+=FancyLogger.fancy_logging("PARENT TRAINING CONCLUDED!!!!!", null);
-                    System.out.println("PARENT TRAINING CONCLUDED!!!!!");
-                    // ****************END PARENT TRAINING ***********************
-                    full_log_string+=FancyLogger.fancy_logging("CHILDREN TRAINING STARTING,.....", null);
-                    System.out.println("CHILDREN TRAINING STARTING,.....");
-
-                    // ****************START CHILDREN TRAINING ***********************
-
-                    // BATCHING ALL THE CHILDREN INTO GROUPS OF 20
-                    List<List<String>> gisJoinBatches_children = batchGisJoins(allchildrenGISList, 20);
-
-                    List<Future<List<ModelResponse>>> batchedModelTasks_children = new ArrayList<>();
-                    for (List<String> gisJoinBatch: gisJoinBatches_children) {
-
-                        GBRegressionTask gbTask = new GBRegressionTask(this.request, gisJoinBatch, trained_parents_map, parentRMSEMap, reverseChildToParentMap);
-                        batchedModelTasks_children.add(this.sparkManager.submit(gbTask, "gb-regression-query"));
-                    }
-
-                    // Wait for each task to complete and return their ModelResponses
-                    for (Future<List<ModelResponse>> indvTask: batchedModelTasks_children) {
-                        List<ModelResponse> batchedModelResponses = indvTask.get();
-                        for (ModelResponse modelResponse: batchedModelResponses) {
-                            //DON'T THINK WE NEED RESPONSE OBSERVER HERE....NOTHING TO PASS BACK. JUST OBSERVE THE RESULTS
-                            full_log_string+=FancyLogger.fancy_logging("RECEIVED A RESPONSE FOR "+modelResponse.getGBoostRegressionResponse().getGisJoin(),log);
-                            this.responseObserver.onNext(modelResponse);
-
+                            }
                         }
-                    }
 
-                    /*List<Future<List<ModelResponse>>> batchedModelTasks = new ArrayList<>();
-                    for (List<String> gisJoinBatch: gisJoinBatches_children) {
-                        GBRegressionTask gbTask = new GBRegressionTask(this.request, gisJoinBatch, trained_parents);
-                        batchedModelTasks.add(this.sparkManager.submit(gbTask, "gb-regression-query"));
-                    }
-
-                    // Wait for each task to complete and return their ModelResponses
-                    for (Future<List<ModelResponse>> indvTask: batchedModelTasks) {
-                        List<ModelResponse> batchedModelResponses = indvTask.get();
-                        for (ModelResponse modelResponse: batchedModelResponses) {
-                            this.responseObserver.onNext(modelResponse);
+                        // JUST ITERATING AND PRINTING THE TRAINED MODELS
+                        java.util.Iterator<Map.Entry<String, GBTRegressionModel>> iterator_trained_models = trained_parents_map.entrySet().iterator();
+                        int cnt = 0;
+                        while (iterator_trained_models.hasNext()) {
+                            Map.Entry<String, GBTRegressionModel> firstEntry = iterator_trained_models.next();
+                            String parentGisJoin = firstEntry.getKey();
+                            parents.add(parentGisJoin);
+                            GBTRegressionModel trained_model = firstEntry.getValue();
+                            trained_model.save(model_save_path+parentGisJoin+".model");
+                            // LOG SOMETHING TO CHECK TRAINED MODEL IS HERE
+                            full_log_string += FancyLogger.fancy_logging("Model Num " + (cnt + 1) + "GISJOIN: " +
+                                    parentGisJoin + " Trained Model: " + trained_model.paramMap(), null);
+                            cnt++;
                         }
-                    }*/
 
-                    System.out.println(full_log_string);
-                    FancyLogger.write_out(full_log_string, filename);
+                        full_log_string += FancyLogger.fancy_logging("PARENT TRAINING CONCLUDED!!!!!", null);
+                        System.out.println("PARENT TRAINING CONCLUDED!!!!!");
 
+                        System.out.println(full_log_string);
+                        FancyLogger.write_out(full_log_string, filename);
 
+                    } else {
+                        // ****************END PARENT TRAINING ***********************
+                        full_log_string += FancyLogger.fancy_logging("CHILDREN TRAINING STARTING,.....", null);
+                        System.out.println("CHILDREN TRAINING STARTING,.....");
+
+                        for(String parent: parents) {
+                            File tempFile = new File(model_save_path+parent+".model");
+                            boolean isSaved = tempFile.exists();
+                            if (isSaved) {
+                                GBTRegressionModel model = GBTRegressionModel.load(model_save_path + parent + ".model");
+                                trained_parents_map.put(parent, model);
+                            } else{
+                                System.out.println("SAVED MODEL NOT FOUND FOR:"+ parent);
+                            }
+                        }
+
+                        // ****************START CHILDREN TRAINING ***********************
+
+                        // BATCHING ALL THE CHILDREN INTO GROUPS OF 20
+                        List<List<String>> gisJoinBatches_children = batchGisJoins(allchildrenGISList, 20);
+
+                        List<Future<List<ModelResponse>>> batchedModelTasks_children = new ArrayList<>();
+                        for (List<String> gisJoinBatch : gisJoinBatches_children) {
+
+                            GBRegressionTask gbTask = new GBRegressionTask(this.request, gisJoinBatch, trained_parents_map, parentRMSEMap, reverseChildToParentMap);
+                            batchedModelTasks_children.add(this.sparkManager.submit(gbTask, "gb-regression-query"));
+                        }
+
+                        // Wait for each task to complete and return their ModelResponses
+                        for (Future<List<ModelResponse>> indvTask : batchedModelTasks_children) {
+                            List<ModelResponse> batchedModelResponses = indvTask.get();
+                            for (ModelResponse modelResponse : batchedModelResponses) {
+                                //DON'T THINK WE NEED RESPONSE OBSERVER HERE....NOTHING TO PASS BACK. JUST OBSERVE THE RESULTS
+                                full_log_string += FancyLogger.fancy_logging("RECEIVED A RESPONSE FOR " + modelResponse.getGBoostRegressionResponse().getGisJoin(), log);
+                                this.responseObserver.onNext(modelResponse);
+
+                            }
+                        }
+
+                        System.out.println(full_log_string);
+                        FancyLogger.write_out(full_log_string, filename);
+                    }
 
                 } catch (Exception e) {
                     log.error("Failed to evaluate query", e);
@@ -752,4 +792,5 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
             log.warn("Invalid Model Request!");
         }
     }
+
 }
