@@ -31,3 +31,6 @@ executable:
 
 clean:
 	rm -rf build log
+
+test-rforest:
+	./gradlew test --tests SustainServerTest.testRForestRegressionModel

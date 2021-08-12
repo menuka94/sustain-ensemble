@@ -45,21 +45,22 @@ import scala.Tuple2;
 import scala.collection.Iterator;
 
 import java.io.File;
-import java.nio.file.Files;
+import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 
 public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelResponse> {
 
-    private String model_save_path = "/s/chopin/e/proj/sustain/sapmitra/spark_mongo/saved_models/";
+    private final String modelSavePath = "file:///s/parsons/b/others/sustain/ensemble-models/";
     private static final double targetVariance = 0.95;
     private static final double samplingPercentage = 0.0003;
     private static final Logger log = LogManager.getLogger(EnsembleQueryHandler.class);
-    private String filename = "driver.txt";
+    private final String fileName = "driver.txt";
 
     public static void main(String arg[]) {
 
-        Map<String, List> opMap = CountyClusters.extractCountyGroups("./src/main/java/org/sustain/handlers/clusters.csv");
+        Map<String, List> opMap = CountyClusters.extractCountyGroups("./src/main/java/org/sustain/handlers/clusters_test.csv");
         System.out.println(opMap);
     }
 
@@ -508,7 +509,7 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
     }
 
 
-    private boolean find_mode(ModelRequest request) {
+    private boolean findMode(ModelRequest request) {
         int val = 7;
         if (request.getType().equals(ModelType.R_FOREST_REGRESSION)){
             RForestRegressionRequest req = request.getRForestRegressionRequest();
@@ -517,14 +518,15 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
         } else if (request.getType().equals(ModelType.G_BOOST_REGRESSION)) {
             GBoostRegressionRequest req = request.getGBoostRegressionRequest();
             val = req.getMaxDepth();
-
         }
 
         if (val >=0) {
-            System.out.println("EXHAUSTIVE MODE !!!!!!!!!!!!!!!!!!!!!!!!!!!");
+            System.out.println("findMode(): Exhaustive mode");
+            log.info("findMode(): Exhaustive mode");
             return true;
         } else {
-            System.out.println("TL MODE !!!!!!!!!!!!!!!!!!!!!!!!!!!");
+            System.out.println("findMode(): TL mode");
+            log.info("findMode(): TL mode");
             return false;
         }
 
@@ -533,21 +535,21 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
     @Override
     public void handleRequest() {
 
-        String full_log_string = "";
+        String fullLogString = "";
         if (isValid(this.request)) {
 
-            boolean isExhaustive = find_mode(this.request);
+            boolean isExhaustive = findMode(this.request);
 
             // PARSE THE CLUSTER CSV
             Map<String, List> clusterCSVMap = CountyClusters.extractCountyGroups("./src/main/java/org/sustain/handlers/clusters_test.csv");
-            full_log_string+=FancyLogger.fancy_logging("CLUSTER_MAP: "+clusterCSVMap, null);
+            fullLogString+=FancyLogger.fancy_logging("CLUSTER_MAP: "+clusterCSVMap, null);
             if (request.getType().equals(ModelType.R_FOREST_REGRESSION)) {
                 {
 
                     try {
                         RForestRegressionRequest req = this.request.getRForestRegressionRequest();
 
-                        Map<String,String> reverseChildToParentMap = new HashMap<>();
+                        Map<String, String> reverseChildToParentMap = new HashMap<>();
 
                         // IGNORE GISJOIN SENT BY THE REQUEST. INSTEAD GET THE FIRST ENTRY
                         java.util.Iterator<Map.Entry<String, List>> iterator = clusterCSVMap.entrySet().iterator();
@@ -568,14 +570,14 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
                             List<String> childrenGisJoin = firstEntry.getValue();
                             allchildrenGISList.addAll(childrenGisJoin);
 
-                            for(String child: childrenGisJoin) {
+                            for (String child : childrenGisJoin) {
                                 reverseChildToParentMap.put(child, parentGisJoin);
                             }
                         }
 
                         List<List<String>> gisJoinBatches_parent = batchGisJoins(parents, 20);
 
-                        if(isExhaustive) {
+                        if (isExhaustive) {
                             // EXHAUSTIVELY TRAINING ALL THE PARENTS FIRST
 
                             // ****************START PARENT TRAINING ***********************
@@ -590,7 +592,7 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
                                 List<ModelResponse> batchedModelResponses = indvTask.get();
                                 for (ModelResponse modelResponse : batchedModelResponses) {
                                     //DON'T THINK WE NEED RESPONSE OBSERVER HERE....NOTHING TO PASS BACK. JUST OBSERVE THE RESULTS
-                                    full_log_string += FancyLogger.fancy_logging("RECEIVED A RESPONSE FOR " + modelResponse.getRForestRegressionResponse().getGisJoin(), log);
+                                    fullLogString += FancyLogger.fancy_logging("RECEIVED A RESPONSE FOR " + modelResponse.getRForestRegressionResponse().getGisJoin(), log);
                                     this.responseObserver.onNext(modelResponse);
 
                                 }
@@ -605,30 +607,30 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
                                 //parents.add(parentGisJoin);
                                 RandomForestRegressionModel trained_model = firstEntry.getValue();
 
-                                trained_model.save(model_save_path+parentGisJoin+".model");
+                                trained_model.save(modelSavePath + parentGisJoin + ".model");
                                 // LOG SOMETHING TO CHECK TRAINED MODEL IS HERE
-                                full_log_string += FancyLogger.fancy_logging("Model Num " + (cnt + 1) + "GISJOIN: " +
-                                        parentGisJoin + " Trained Model: " + trained_model.paramMap(), null);
+                                fullLogString += FancyLogger.fancy_logging("Model Num " + (cnt + 1) + "GISJOIN: " +
+                                    parentGisJoin + " Trained Model: " + trained_model.paramMap(), null);
                                 cnt++;
                             }
 
-                            full_log_string += FancyLogger.fancy_logging("PARENT TRAINING CONCLUDED!!!!!", null);
+                            fullLogString += FancyLogger.fancy_logging("PARENT TRAINING CONCLUDED!!!!!", null);
                             System.out.println("PARENT TRAINING CONCLUDED!!!!!");
-                            System.out.println(full_log_string);
-                            FancyLogger.write_out(full_log_string, filename);
+                            System.out.println(fullLogString);
+                            FancyLogger.write_out(fullLogString, fileName);
 
                         } else {
                             // ****************END PARENT TRAINING ***********************
-                            full_log_string += FancyLogger.fancy_logging("CHILDREN TRAINING STARTING,.....", null);
+                            fullLogString += FancyLogger.fancy_logging("CHILDREN TRAINING STARTING,.....", null);
                             System.out.println("CHILDREN TRAINING STARTING,.....");
-                            for(String parent: parents) {
-                                File tempFile = new File(model_save_path+parent+".model");
+                            for (String parent : parents) {
+                                File tempFile = new File(modelSavePath + parent + ".model");
                                 boolean isSaved = tempFile.exists();
                                 if (isSaved) {
-                                    RandomForestRegressionModel model = RandomForestRegressionModel.load(model_save_path + parent + ".model");
+                                    RandomForestRegressionModel model = RandomForestRegressionModel.load(modelSavePath + parent + ".model");
                                     trained_parents_map.put(parent, model);
-                                } else{
-                                    System.out.println("SAVED MODEL NOT FOUND FOR:"+ parent);
+                                } else {
+                                    System.out.println("SAVED MODEL NOT FOUND FOR:" + parent);
                                 }
                             }
 
@@ -649,19 +651,27 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
                                 List<ModelResponse> batchedModelResponses = indvTask.get();
                                 for (ModelResponse modelResponse : batchedModelResponses) {
                                     //DON'T THINK WE NEED RESPONSE OBSERVER HERE....NOTHING TO PASS BACK. JUST OBSERVE THE RESULTS
-                                    full_log_string += FancyLogger.fancy_logging("RECEIVED A RESPONSE FOR " + modelResponse.getRForestRegressionResponse().getGisJoin(), log);
+                                    fullLogString += FancyLogger.fancy_logging("RECEIVED A RESPONSE FOR " + modelResponse.getRForestRegressionResponse().getGisJoin(), log);
                                     this.responseObserver.onNext(modelResponse);
 
                                 }
                             }
 
-                            System.out.println(full_log_string);
-                            FancyLogger.write_out(full_log_string, filename);
+                            System.out.println(fullLogString);
+                            FancyLogger.write_out(fullLogString, fileName);
 
                         }
-
+                    } catch (IOException e) {
+                        log.error("Failed to evaluate query: IOException: ", e);
+                        responseObserver.onError(e);
+                    } catch (InterruptedException e) {
+                        log.error("Failed to evaluate query: InterruptedException: ", e);
+                        responseObserver.onError(e);
+                    } catch (ExecutionException e) {
+                        log.error("Failed to evaluate query: ExecutionException: ", e);
+                        responseObserver.onError(e);
                     } catch (Exception e) {
-                        log.error("Failed to evaluate query", e);
+                        log.error("Failed to evaluate query: Exception: ", e);
                         responseObserver.onError(e);
                     }
                 }
@@ -713,7 +723,7 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
                             List<ModelResponse> batchedModelResponses = indvTask.get();
                             for (ModelResponse modelResponse : batchedModelResponses) {
                                 //DON'T THINK WE NEED RESPONSE OBSERVER HERE....NOTHING TO PASS BACK. JUST OBSERVE THE RESULTS
-                                full_log_string += FancyLogger.fancy_logging("RECEIVED A RESPONSE FOR " + modelResponse.getGBoostRegressionResponse().getGisJoin(), log);
+                                fullLogString += FancyLogger.fancy_logging("RECEIVED A RESPONSE FOR " + modelResponse.getGBoostRegressionResponse().getGisJoin(), log);
                                 this.responseObserver.onNext(modelResponse);
 
                             }
@@ -727,29 +737,29 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
                             String parentGisJoin = firstEntry.getKey();
                             parents.add(parentGisJoin);
                             GBTRegressionModel trained_model = firstEntry.getValue();
-                            trained_model.save(model_save_path+parentGisJoin+".model");
+                            trained_model.save(modelSavePath +parentGisJoin+".model");
                             // LOG SOMETHING TO CHECK TRAINED MODEL IS HERE
-                            full_log_string += FancyLogger.fancy_logging("Model Num " + (cnt + 1) + "GISJOIN: " +
+                            fullLogString += FancyLogger.fancy_logging("Model Num " + (cnt + 1) + "GISJOIN: " +
                                     parentGisJoin + " Trained Model: " + trained_model.paramMap(), null);
                             cnt++;
                         }
 
-                        full_log_string += FancyLogger.fancy_logging("PARENT TRAINING CONCLUDED!!!!!", null);
+                        fullLogString += FancyLogger.fancy_logging("PARENT TRAINING CONCLUDED!!!!!", null);
                         System.out.println("PARENT TRAINING CONCLUDED!!!!!");
 
-                        System.out.println(full_log_string);
-                        FancyLogger.write_out(full_log_string, filename);
+                        System.out.println(fullLogString);
+                        FancyLogger.write_out(fullLogString, fileName);
 
                     } else {
                         // ****************END PARENT TRAINING ***********************
-                        full_log_string += FancyLogger.fancy_logging("CHILDREN TRAINING STARTING,.....", null);
+                        fullLogString += FancyLogger.fancy_logging("CHILDREN TRAINING STARTING,.....", null);
                         System.out.println("CHILDREN TRAINING STARTING,.....");
 
                         for(String parent: parents) {
-                            File tempFile = new File(model_save_path+parent+".model");
+                            File tempFile = new File(modelSavePath +parent+".model");
                             boolean isSaved = tempFile.exists();
                             if (isSaved) {
-                                GBTRegressionModel model = GBTRegressionModel.load(model_save_path + parent + ".model");
+                                GBTRegressionModel model = GBTRegressionModel.load(modelSavePath + parent + ".model");
                                 trained_parents_map.put(parent, model);
                             } else{
                                 System.out.println("SAVED MODEL NOT FOUND FOR:"+ parent);
@@ -773,14 +783,14 @@ public class EnsembleQueryHandler extends GrpcSparkHandler<ModelRequest, ModelRe
                             List<ModelResponse> batchedModelResponses = indvTask.get();
                             for (ModelResponse modelResponse : batchedModelResponses) {
                                 //DON'T THINK WE NEED RESPONSE OBSERVER HERE....NOTHING TO PASS BACK. JUST OBSERVE THE RESULTS
-                                full_log_string += FancyLogger.fancy_logging("RECEIVED A RESPONSE FOR " + modelResponse.getGBoostRegressionResponse().getGisJoin(), log);
+                                fullLogString += FancyLogger.fancy_logging("RECEIVED A RESPONSE FOR " + modelResponse.getGBoostRegressionResponse().getGisJoin(), log);
                                 this.responseObserver.onNext(modelResponse);
 
                             }
                         }
 
-                        System.out.println(full_log_string);
-                        FancyLogger.write_out(full_log_string, filename);
+                        System.out.println(fullLogString);
+                        FancyLogger.write_out(fullLogString, fileName);
                     }
 
                 } catch (Exception e) {

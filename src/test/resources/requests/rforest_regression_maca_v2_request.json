@@ -18,7 +18,7 @@
     "numTrees": 10,
     "featureSubsetStrategy": "sqrt",
     "impurity": "variance",
-    "maxDepth": 4,
+    "maxDepth": 1,
     "maxBins": 50,
     "trainSplit": 0.9,
     "minInfoGain" : 0.01,
